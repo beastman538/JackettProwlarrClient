@@ -246,16 +246,19 @@ object HeadlessBrowserHelper {
         return NativePage(url).also { it.setHtml(html) }
     }
 
-    private fun extractVideoUrlsFromHtml(html: String, baseUrl: String): List<String> {
+        private fun extractVideoUrlsFromHtml(html: String, baseUrl: String): List<String> {
         val found = mutableSetOf<String>()
         for (pattern in VIDEO_SOURCE_PATTERNS) {
-            pattern.findAll(html).forEach { m ->
+            // Fix 1: Changed .forEach to a standard for loop
+            for (m in pattern.findAll(html)) {
                 val u = (m.groupValues.getOrNull(1) ?: m.value).trim().trimEnd('"', '\'')
                 if (u.startsWith("http") && u.length > 15) found.add(u)
             }
         }
         try {
-            Jsoup.parse(html, baseUrl).select("video[src], source[src], video > source").forEach { el ->
+            val elements = Jsoup.parse(html, baseUrl).select("video[src], source[src], video > source")
+            // Fix 2: Changed .forEach to a standard for loop
+            for (el in elements) {
                 val src = el.absUrl("src").ifEmpty { el.attr("src") }
                 if (src.startsWith("http")) found.add(src)
             }
