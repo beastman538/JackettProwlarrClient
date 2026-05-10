@@ -968,7 +968,9 @@ fun RecentSearches(
                             )
                         }
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                            imageVector = Icons.Default.ArrowForward,
+
+
                             contentDescription = null,
                             tint = CyberCyan,
                             modifier = Modifier.size(20.dp)
