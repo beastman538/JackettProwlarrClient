@@ -37,6 +37,7 @@ import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.SearchViewModel
 import com.aggregatorx.app.ui.viewmodel.VideoPreviewResult
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.shape.CircleShape
 
 // Quick-tab sentinel IDs
 private const val TAB_TOP    = "__TOP__"
