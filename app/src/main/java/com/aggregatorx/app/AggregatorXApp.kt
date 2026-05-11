@@ -6,7 +6,7 @@ import androidx.multidex.MultiDex
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkLayerFactory
-import coil3.request.crossfade
+import coil3.request.crossfade // Ensure this exact import is here
 import dagger.hilt.android.HiltAndroidApp
 
 /**
@@ -25,6 +25,9 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
         instance = this
     }
 
+    /**
+     * Configures the global image loader for thumbnails and previews.
+     */
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
