@@ -9,7 +9,7 @@ plugins {
 }
 
 android {
-    namespace = "com.aggregatorx.app" 
+    namespace = "com.aggregatorx.app"
     compileSdk = 35
 
     defaultConfig {
@@ -21,14 +21,19 @@ android {
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        vectorDrawables { useSupportLibrary = true }
+        vectorDrawables {
+            useSupportLibrary = true
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
@@ -48,54 +53,59 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "META-INF/versions/9/previous-compilation-data.bin"
+            // Fixes specific Coil3/OkHttp conflict during assembly
             pickFirsts += "META-INF/coil3-network-okhttp.kotlin_module"
+            pickFirsts += "META-INF/okhttp3/okhttp.kotlin_module"
         }
     }
 }
 
 dependencies {
-    // Core & Lifecycle
+    // --- CORE & LIFECYCLE ---
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.multidex:multidex:2.0.1")
 
-    // Compose
+    // --- COMPOSE ---
     implementation(platform("androidx.compose:compose-bom:2025.02.00"))
     implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.8.7")
     
-    // Icons (Fixes 'Pause', 'PlayCircle', 'Speed', 'Shield', etc.)
+    // Icons (Fixes 'Dns', 'Pause', 'PlayArrow', etc.)
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Hilt
+    // --- HILT ---
     implementation("com.google.dagger:hilt-android:2.55")
     kapt("com.google.dagger:hilt-compiler:2.55")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Room
+    // --- ROOM ---
     val roomVersion = "2.6.1"
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
 
-    // OkHttp & Extensions (Fixes 'logging' and 'dnsoverhttps')
+    // --- NETWORKING (OkHttp & Retrofit) ---
     implementation(platform("com.squareup.okhttp3:okhttp-bom:4.12.0"))
     implementation("com.squareup.okhttp3:okhttp")
     implementation("com.squareup.okhttp3:logging-interceptor")
     implementation("com.squareup.okhttp3:okhttp-dnsoverhttps")
-
-    // Retrofit
+    
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
 
-    // Coil 3 (Fixes 'OkHttpNetworkLayerFactory')
-    implementation("io.coil-kt.coil3:coil-compose:3.1.0")
-    implementation("io.coil-kt.coil3:coil-network-okhttp:3.1.0")
+    // --- COIL 3 (Image Loading) ---
+    val coilVersion = "3.1.0"
+    implementation("io.coil-kt.coil3:coil-compose:$coilVersion")
+    implementation("io.coil-kt.coil3:coil-network-okhttp:$coilVersion")
 
-    // Media3 / ExoPlayer (Fixes 'HlsMediaSource', 'DashMediaSource', 'hls', 'dash')
+    // --- MEDIA3 (ExoPlayer) ---
     val media3Version = "1.5.1"
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
@@ -103,12 +113,15 @@ dependencies {
     implementation("androidx.media3:media3-ui:$media3Version")
     implementation("androidx.media3:media3-common:$media3Version")
 
-    // ML Kit (Fixes 'mlkit', 'TextRecognition', 'InputImage')
+    // --- ML KIT & UTILS ---
     implementation("com.google.mlkit:text-recognition:16.0.1")
-
-    // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
     implementation("org.jsoup:jsoup:1.18.3")
+
+    // --- TESTING ---
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
 }
 
 kapt {
