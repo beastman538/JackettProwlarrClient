@@ -1,20 +1,21 @@
 package com.aggregatorx.app
 
-import androidx.multidex.MultiDexApplication
+import android.app.Application
+import android.content.Context
+import androidx.multidex.MultiDex
 import dagger.hilt.android.HiltAndroidApp
 
 /**
  * AggregatorX - Advanced Multi-Provider Web Scraping Aggregator
- * * Features:
- * - Multi-provider search with intelligent result aggregation
- * - Advanced site analyzer with DOM parsing and pattern recognition
- * - Resilient scraping with fallback mechanisms
- * - Beautiful modern UI with smooth scrolling
- * - Provider management with enable/disable toggles
- * - Smart ranking system for search results
  */
 @HiltAndroidApp
-class AggregatorXApp : MultiDexApplication() {
+class AggregatorXApp : Application() {
+    
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(base)
+        // Manually enable MultiDex before the rest of the app loads
+        MultiDex.install(this)
+    }
     
     override fun onCreate() {
         super.onCreate()
