@@ -164,7 +164,6 @@ object HeadlessBrowserHelper {
 
     // ── Form-based search ─────────────────────────────────────────────────────
 
-        fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
             fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
         runBlocking {
             val html = fetchRaw(baseUrl) ?: return@runBlocking null
@@ -187,23 +186,24 @@ object HeadlessBrowserHelper {
 
             try {
                 if (method == "post") {
-                    // FIX: Replaced the .apply { fields.forEach ... } with a clean for loop
                     val bodyBuilder = FormBody.Builder()
                     for (entry in fields) {
                         bodyBuilder.add(entry.key, entry.value)
                     }
                     val body = bodyBuilder.build()
-                    
                     val req = Request.Builder().url(action).post(body).header("Referer", baseUrl).build()
                     client.newCall(req).execute().use { it.body?.string() }
                 } else {
                     val qs = fields.entries.joinToString("&") {
-                        "${URLEncoder.encode(it.key,"UTF-8")}=${URLEncoder.encode(it.value,"UTF-8")}"
+                        "${URLEncoder.encode(it.key, "UTF-8")}=${URLEncoder.encode(it.value, "UTF-8")}"
                     }
                     val getUrl = if (action.contains("?")) "$action&$qs" else "$action?$qs"
                     fetchRaw(getUrl)
                 }
-            } catch (e: Exception) { Log.w(TAG, "Form submit: ${e.message}"); html }
+            } catch (e: Exception) { 
+                Log.w(TAG, "Form submit: ${e.message}")
+                html 
+            }
         }
 
 
