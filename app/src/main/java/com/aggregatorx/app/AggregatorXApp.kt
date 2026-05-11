@@ -6,6 +6,7 @@ import androidx.multidex.MultiDex
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkLayerFactory
+import coil3.request.crossfade
 import dagger.hilt.android.HiltAndroidApp
 
 /**
@@ -16,7 +17,6 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
-        // Manually enable MultiDex before the rest of the app loads
         MultiDex.install(this)
     }
     
@@ -25,17 +25,11 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
         instance = this
     }
 
-    /**
-     * Coil 3 Singleton Configuration
-     * This ensures thumbnails and previews can be fetched over the network.
-     */
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
-                // Adds OkHttp support for Coil 3
                 add(OkHttpNetworkLayerFactory())
             }
-            // Optional: Add a crossfade for smoother thumbnail loading
             .crossfade(true)
             .build()
     }
