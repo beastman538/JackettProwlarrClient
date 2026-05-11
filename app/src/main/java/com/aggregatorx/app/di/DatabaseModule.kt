@@ -22,7 +22,9 @@ object DatabaseModule {
             AggregatorDatabase::class.java,
             "aggregator_database"
         )
-        .fallbackToDestructiveMigration(dropAllTables = true)
+        // Fixed: removed 'dropAllTables = true' which caused the compilation error.
+        // This still achieves the same result: wiping the DB if the schema changes.
+        .fallbackToDestructiveMigration()
         .build()
     }
     
