@@ -32,9 +32,11 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.aggregatorx.app.data.model.ProviderSearchResults
 import com.aggregatorx.app.data.model.SearchResult
+import com.aggregatorx.app.ui.VideoPlayerActivity
 import com.aggregatorx.app.ui.components.*
 import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.SearchViewModel
+import com.aggregatorx.app.ui.viewmodel.VideoExtractionState
 import com.aggregatorx.app.ui.viewmodel.VideoPreviewResult
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.CircleShape
@@ -49,16 +51,21 @@ private const val TAB_TOKENS = "__TOKENS__"
 fun SearchScreen(
     viewModel: SearchViewModel = hiltViewModel()
 ) {
-    val uiState         by viewModel.uiState.collectAsState()
-    val providerResults by viewModel.providerResults.collectAsState()
-    val likedUrls       by viewModel.likedUrls.collectAsState()
-    val isPaused        by viewModel.isDiscoveryPaused.collectAsState()
-    val providerPages   by viewModel.providerPages.collectAsState()
-    val tokenResults    by viewModel.tokenResults.collectAsState()
-    val myAiResults     by viewModel.myAiResults.collectAsState()
-    val context         = LocalContext.current
-    val listState       = rememberLazyListState()
-    val scope           = rememberCoroutineScope()
+    val uiState              by viewModel.uiState.collectAsState()
+    val providerResults      by viewModel.providerResults.collectAsState()
+    val likedUrls            by viewModel.likedUrls.collectAsState()
+    val isPaused             by viewModel.isDiscoveryPaused.collectAsState()
+    val providerPages        by viewModel.providerPages.collectAsState()
+    val tokenResults         by viewModel.tokenResults.collectAsState()
+    val myAiResults          by viewModel.myAiResults.collectAsState()
+    val videoExtractionState by viewModel.videoExtractionState.collectAsState()
+    val context              = LocalContext.current
+    val listState            = rememberLazyListState()
+    val scope                = rememberCoroutineScope()
+
+    // When true the next extraction Success should launch VideoPlayerActivity
+    // instead of showing the in-screen dialog (set by the "In App" button).
+    var pendingInAppLaunch by remember { mutableStateOf(false) }
 
     var activeTab by remember { mutableStateOf(TAB_TOP) }
 
@@ -162,7 +169,29 @@ fun SearchScreen(
                         onBrowser                = { result ->
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
                         },
-                        onInApp                  = { result -> viewModel.extractVideoUrl(result) },
+                        onInApp                  = { result ->
+                            // If extraction already succeeded for this result, launch immediately.
+                            val currentState = viewModel.videoExtractionState.value
+                            if (currentState is VideoExtractionState.Success &&
+                                currentState.title == result.title
+                            ) {
+                                context.startActivity(
+                                    VideoPlayerActivity.buildIntent(
+                                        context  = context,
+                                        videoUrl = currentState.videoUrl,
+                                        title    = result.title,
+                                        headers  = currentState.headers
+                                    )
+                                )
+                                viewModel.resetVideoState()
+                            } else {
+                                // Kick off extraction; the LaunchedEffect below will
+                                // auto-launch VideoPlayerActivity once it completes.
+                                pendingInAppLaunch = true
+                                viewModel.extractVideoUrl(result)
+                                Toast.makeText(context, "Loading: ${result.title}…", Toast.LENGTH_SHORT).show()
+                            }
+                        },
                         onLike                   = { result -> viewModel.toggleLike(result) },
                         onNextPage               = { id -> viewModel.nextProviderPage(id) },
                         onPrevPage               = { id -> viewModel.prevProviderPage(id) },
@@ -197,6 +226,115 @@ fun SearchScreen(
                 }
             ) { Text(error) }
         }
+
+        // ── VIDEO EXTRACTION STATES ───────────────────────────────────────
+        when (val vs = videoExtractionState) {
+
+            // Extracting: show a non-blocking loading chip at the bottom
+            is VideoExtractionState.Extracting -> {
+                Surface(
+                    modifier       = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 72.dp, start = 24.dp, end = 24.dp),
+                    shape          = RoundedCornerShape(24.dp),
+                    color          = DarkCard,
+                    shadowElevation = 8.dp,
+                    border         = BorderStroke(1.dp, CyberCyan.copy(alpha = 0.4f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier    = Modifier.size(18.dp),
+                            color       = CyberCyan,
+                            strokeWidth = 2.dp
+                        )
+                        Text(
+                            "Extracting stream…",
+                            color     = TextPrimary,
+                            fontSize  = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        TextButton(onClick = viewModel::resetVideoState) {
+                            Text("Cancel", color = TextTertiary, fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+
+            // Success: either launch VideoPlayerActivity (In App) or show dialog (Watch)
+            is VideoExtractionState.Success -> {
+                if (pendingInAppLaunch) {
+                    // "In App" path — launch the full-screen activity and clear state
+                    LaunchedEffect(vs.videoUrl) {
+                        pendingInAppLaunch = false
+                        context.startActivity(
+                            VideoPlayerActivity.buildIntent(
+                                context  = context,
+                                videoUrl = vs.videoUrl,
+                                title    = vs.title,
+                                headers  = vs.headers
+                            )
+                        )
+                        viewModel.resetVideoState()
+                    }
+                } else {
+                    // "Watch" path — show the in-screen VideoPlayerDialog
+                    VideoPlayerDialog(
+                        videoUrl       = vs.videoUrl,
+                        title          = vs.title,
+                        headers        = vs.headers.ifEmpty { null },
+                        onDismiss      = viewModel::resetVideoState,
+                        onDownload     = { viewModel.downloadVideoUrl(vs.videoUrl, vs.title) },
+                        onOpenExternal = {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(vs.videoUrl)))
+                            viewModel.resetVideoState()
+                        }
+                    )
+                }
+            }
+
+            // Error: show a dismissible snackbar-style chip
+            is VideoExtractionState.Error -> {
+                Surface(
+                    modifier       = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 72.dp, start = 16.dp, end = 16.dp),
+                    shape          = RoundedCornerShape(12.dp),
+                    color          = AccentRed.copy(alpha = 0.92f),
+                    shadowElevation = 8.dp
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.ErrorOutline,
+                            contentDescription = null,
+                            tint   = TextPrimary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            vs.message,
+                            color    = TextPrimary,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = viewModel::resetVideoState) {
+                            Text("✕", color = TextPrimary, fontSize = 14.sp)
+                        }
+                    }
+                }
+            }
+
+            else -> Unit // Idle — nothing to show
+        }
+
     }
 }
 
@@ -650,6 +788,13 @@ fun ShieldedResultCard(
     onExtractVideoForPreview: (suspend (String) -> VideoPreviewResult?)? = null,
     modifier: Modifier = Modifier
 ) {
+    val scope = rememberCoroutineScope()
+
+    // Inline preview state: null = not started, "" = extracting, else = URL
+    var inlineVideoUrl  by remember(result.url) { mutableStateOf<String?>(null) }
+    var isExtracting    by remember(result.url) { mutableStateOf(false) }
+    var showInlinePlayer by remember(result.url) { mutableStateOf(false) }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -660,52 +805,144 @@ fun ShieldedResultCard(
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
 
-            // Title + quality badge
+            // ── THUMBNAIL + TITLE ROW ─────────────────────────────────────
             Row(verticalAlignment = Alignment.Top) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        result.title,
-                        color = TextPrimary, fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis
+
+                // Thumbnail (shown when available; tapping starts inline preview)
+                if (!result.thumbnailUrl.isNullOrEmpty()) {
+                    InlineThumbnailPreview(
+                        thumbnailUrl     = result.thumbnailUrl,
+                        duration         = result.duration,
+                        isExtracting     = isExtracting,
+                        onHoldFullscreen = {
+                            // Long-press → extract and play inline
+                            if (inlineVideoUrl != null) {
+                                showInlinePlayer = true
+                            } else if (!isExtracting && onExtractVideoForPreview != null) {
+                                isExtracting = true
+                                scope.launch {
+                                    val preview = onExtractVideoForPreview(result.url)
+                                    inlineVideoUrl = preview?.videoUrl
+                                    isExtracting   = false
+                                    if (!inlineVideoUrl.isNullOrEmpty()) {
+                                        showInlinePlayer = true
+                                    }
+                                }
+                            } else {
+                                // Fallback: trigger the full Watch flow
+                                onWatch()
+                            }
+                        },
+                        modifier = Modifier
+                            .width(100.dp)
+                            .height(70.dp)
+                            .clip(RoundedCornerShape(6.dp))
                     )
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        result.providerName.ifEmpty { result.url },
-                        color = TextTertiary, fontSize = 10.sp,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                    )
+                    Spacer(Modifier.width(10.dp))
                 }
-                // Quality badge
-                val quality = result.quality ?: ""
-                if (quality.isNotEmpty()) {
-                    Spacer(Modifier.width(8.dp))
-                    Surface(
-                        shape = RoundedCornerShape(4.dp),
-                        color = getQualityColor(quality).copy(alpha = 0.15f),
-                        border = BorderStroke(0.5.dp, getQualityColor(quality))
-                    ) {
-                        Text(
-                            quality.uppercase(),
-                            color = getQualityColor(quality),
-                            fontSize = 9.sp, fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
+
+                // Title + provider + quality badge
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.Top) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                result.title,
+                                color = TextPrimary, fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(Modifier.height(3.dp))
+                            Text(
+                                result.providerName.ifEmpty { result.url },
+                                color = TextTertiary, fontSize = 10.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        // Quality badge
+                        val quality = result.quality ?: ""
+                        if (quality.isNotEmpty()) {
+                            Spacer(Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = getQualityColor(quality).copy(alpha = 0.15f),
+                                border = BorderStroke(0.5.dp, getQualityColor(quality))
+                            ) {
+                                Text(
+                                    quality.uppercase(),
+                                    color = getQualityColor(quality),
+                                    fontSize = 9.sp, fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    // Metadata: duration, size, seeds
+                    val meta = buildList {
+                        result.duration?.let { add("⏱ $it") }
+                        result.size?.let { add("💾 $it") }
+                        result.seeders?.let { if (it > 0) add("🌱 $it") }
+                    }
+                    if (meta.isNotEmpty()) {
+                        Spacer(Modifier.height(5.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            meta.forEach { m ->
+                                Text(m, color = TextTertiary, fontSize = 10.sp)
+                            }
+                        }
                     }
                 }
             }
 
-            // Metadata row: duration, size, seeds
-            val meta = buildList {
-                result.duration?.let { add("⏱ $it") }
-                result.size?.let { add("💾 $it") }
-                result.seeders?.let { if (it > 0) add("🌱 $it") }
-            }
-            if (meta.isNotEmpty()) {
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    meta.forEach { m ->
-                        Text(m, color = TextTertiary, fontSize = 10.sp)
+            // ── INLINE VIDEO PLAYER (tap-on-thumbnail preview) ────────────
+            AnimatedVisibility(
+                visible = showInlinePlayer && !inlineVideoUrl.isNullOrEmpty(),
+                enter   = expandVertically() + fadeIn(),
+                exit    = shrinkVertically() + fadeOut()
+            ) {
+                val url = inlineVideoUrl ?: ""
+                if (url.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                    ) {
+                        InlineExoPlayerView(
+                            videoUrl = url,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Close inline player button
+                        IconButton(
+                            onClick = { showInlinePlayer = false },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(4.dp)
+                                .size(28.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(Color.Black.copy(alpha = 0.6f))
+                        ) {
+                            Icon(
+                                Icons.Default.Close, "Close preview",
+                                tint = Color.White, modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        // Expand to fullscreen button
+                        IconButton(
+                            onClick = onWatch,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(4.dp)
+                                .size(28.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(Color.Black.copy(alpha = 0.6f))
+                        ) {
+                            Icon(
+                                Icons.Default.Fullscreen, "Fullscreen",
+                                tint = CyberCyan, modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -720,7 +957,7 @@ fun ShieldedResultCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                ActionBtn("▶", "Watch",    NeonGreen,   onWatch)
+                ActionBtn("▶", "Watch",    NeonGreen,    onWatch)
                 ActionBtn("⬇", "Download", NeonGreenDim, onDownload)
                 ActionBtn("↑", "Browser",  TextSecondary, onBrowser)
                 ActionBtn("👁", "In App",  CyberPurple,  onInApp)
@@ -753,6 +990,86 @@ private fun ActionBtn(
         Text(emoji, fontSize = 13.sp)
         Spacer(Modifier.width(3.dp))
         Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+/**
+ * Lightweight embedded ExoPlayer view used for the inline thumbnail preview.
+ * No custom controls — just the raw video surface with a buffering indicator.
+ * The user can expand to fullscreen via the Watch button.
+ */
+@Composable
+private fun InlineExoPlayerView(
+    videoUrl: String,
+    modifier: Modifier = Modifier
+) {
+    val context     = androidx.compose.ui.platform.LocalContext.current
+    var isBuffering by remember { mutableStateOf(true) }
+
+    val httpFactory = remember(videoUrl) {
+        androidx.media3.datasource.DefaultHttpDataSource.Factory()
+            .setUserAgent(com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT)
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
+            .setAllowCrossProtocolRedirects(true)
+    }
+
+    val exoPlayer = remember(videoUrl) {
+        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            val uri    = android.net.Uri.parse(videoUrl)
+            val lower  = videoUrl.lowercase()
+            val source = when {
+                lower.contains(".m3u8") || lower.contains("/hls/") ->
+                    androidx.media3.exoplayer.hls.HlsMediaSource.Factory(httpFactory)
+                        .setAllowChunklessPreparation(true)
+                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                lower.contains(".mpd") || lower.contains("/dash/") ->
+                    androidx.media3.exoplayer.dash.DashMediaSource.Factory(httpFactory)
+                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                else ->
+                    androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(httpFactory)
+                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+            }
+            setMediaSource(source)
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(exoPlayer) {
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                isBuffering = state == androidx.media3.common.Player.STATE_BUFFERING
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            exoPlayer.release()
+        }
+    }
+
+    Box(modifier = modifier.background(Color.Black)) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                androidx.media3.ui.PlayerView(ctx).apply {
+                    player        = exoPlayer
+                    useController = false
+                    layoutParams  = android.widget.FrameLayout.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        if (isBuffering) {
+            CircularProgressIndicator(
+                color    = CyberCyan,
+                modifier = Modifier.size(32.dp).align(Alignment.Center),
+                strokeWidth = 2.dp
+            )
+        }
     }
 }
 
