@@ -1765,16 +1765,66 @@ class ScrapingEngine @Inject constructor(
     }
     
     private fun extractBestThumbnail(item: Element, baseUrl: String): String? {
+        // 1. Try all img attributes in priority order
         val img = item.select("img").firstOrNull()
-        val src = img?.attr("src") 
-            ?: img?.attr("data-src") 
-            ?: img?.attr("data-lazy-src")
-            ?: return null
-        
-        if (src.isNotEmpty() && !src.contains("placeholder") && !src.contains("blank")) {
-            return normalizeUrl(src, baseUrl)
+        val imgSrc = img?.attr("src")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-lazy-src")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-original")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-poster")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-thumbnail")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-bg")?.takeIf { it.isNotEmpty() }
+
+        if (!imgSrc.isNullOrEmpty() && isValidThumbnailUrl(imgSrc)) {
+            return normalizeUrl(imgSrc, baseUrl)
         }
+
+        // 2. Any img anywhere in the item
+        item.select("img[src]").forEach { el ->
+            val src = el.attr("src").takeIf { it.isNotEmpty() } ?: return@forEach
+            if (isValidThumbnailUrl(src)) return normalizeUrl(src, baseUrl)
+        }
+
+        // 3. data-* attributes on any element that look like image URLs
+        item.allElements.forEach { el ->
+            listOf("data-src", "data-image", "data-thumb", "data-poster",
+                   "data-thumbnail", "data-bg", "data-background").forEach { attr ->
+                val v = el.attr(attr).takeIf { it.isNotEmpty() } ?: return@forEach
+                if (isValidThumbnailUrl(v)) return normalizeUrl(v, baseUrl)
+            }
+        }
+
+        // 4. CSS background-image inline style
+        item.allElements.forEach { el ->
+            val style = el.attr("style")
+            if (style.contains("background-image", ignoreCase = true)) {
+                val match = Regex("""url\(['"]?([^'")\s]+)['"]?\)""").find(style)
+                val url = match?.groupValues?.getOrNull(1)
+                if (!url.isNullOrEmpty() && isValidThumbnailUrl(url)) {
+                    return normalizeUrl(url, baseUrl)
+                }
+            }
+        }
+
         return null
+    }
+
+    private fun isValidThumbnailUrl(src: String): Boolean {
+        if (src.isBlank()) return false
+        val lower = src.lowercase()
+        // Reject obvious non-image / placeholder patterns
+        val rejectPatterns = listOf(
+            "placeholder", "blank.gif", "blank.png", "spacer", "pixel.gif",
+            "1x1", "transparent", "data:image/gif", "javascript:", "#"
+        )
+        if (rejectPatterns.any { lower.contains(it) }) return false
+        // Accept if it has an image extension or looks like a CDN image path
+        val acceptPatterns = listOf(
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp",
+            "/thumb", "/poster", "/cover", "/image", "/img", "/photo",
+            "tmdb.org", "imdb.com", "tvdb.com", "fanart.tv", "thetvdb.com"
+        )
+        return acceptPatterns.any { lower.contains(it) } || src.startsWith("http")
     }
     
     /**

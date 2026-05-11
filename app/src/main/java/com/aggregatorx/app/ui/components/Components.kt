@@ -47,6 +47,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import androidx.compose.ui.viewinterop.AndroidView
 
 /**
  * Futuristic Search Bar with glow effect
@@ -424,37 +429,32 @@ fun StatChip(
 /**
  * Result Thumbnail Component
  *
- * Gesture mapping (matches user expectation):
- *   TAP        → quick animated preview pulse (visual feedback only — lightweight)
- *   LONG PRESS → triggers fullscreen video extraction & playback of the FULL video
+ * Gesture mapping:
+ *   TAP        → opens a full-screen thumbnail preview dialog with play option
+ *   LONG PRESS → triggers video extraction & inline playback
  *
- * This component is intentionally lightweight — NO inline ExoPlayer.
- * All heavy video extraction + playback happens in the fullscreen VideoPlayerDialog.
+ * Always attempts to display a thumbnail. Shows a styled placeholder when
+ * no URL is available or the image fails to load.
  */
 @Composable
 fun InlineThumbnailPreview(
     thumbnailUrl: String?,
     duration: String? = null,
     modifier: Modifier = Modifier,
+    onTapPreview: () -> Unit = {},
     onHoldFullscreen: () -> Unit = {},
     isExtracting: Boolean = false
 ) {
     val context = LocalContext.current
     var imageLoadFailed by remember { mutableStateOf(false) }
-    // Tap ripple animation
     var showTapPulse by remember { mutableStateOf(false) }
     val pulseAlpha by animateFloatAsState(
-        targetValue = if (showTapPulse) 0.5f else 0f,
-        animationSpec = tween(durationMillis = 300),
-        finishedListener = { if (showTapPulse) showTapPulse = false }
+        targetValue = if (showTapPulse) 0.45f else 0f,
+        animationSpec = tween(durationMillis = 280),
+        label = "tap_pulse"
     )
-
-    // Reset pulse after brief flash
     LaunchedEffect(showTapPulse) {
-        if (showTapPulse) {
-            delay(350)
-            showTapPulse = false
-        }
+        if (showTapPulse) { delay(320); showTapPulse = false }
     }
 
     Box(
@@ -463,34 +463,29 @@ fun InlineThumbnailPreview(
             .background(DarkSurfaceVariant)
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = {
-                        // TAP → visual pulse feedback (lightweight preview indication)
-                        showTapPulse = true
-                    },
-                    onLongPress = {
-                        // LONG PRESS → open fullscreen video player with FULL video
-                        onHoldFullscreen()
-                    }
+                    onTap        = { showTapPulse = true; onTapPreview() },
+                    onLongPress  = { onHoldFullscreen() }
                 )
             }
     ) {
-        // ── Thumbnail Image ───────────────────────────────────────────────
+        // ── Thumbnail image (always attempted) ───────────────────────────
         if (!thumbnailUrl.isNullOrEmpty()) {
             AsyncImage(
                 model = ImageRequest.Builder(context)
                     .data(thumbnailUrl)
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .memoryCachePolicy(CachePolicy.ENABLED)
+                    .crossfade(true)
                     .build(),
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop,
-                onError = { imageLoadFailed = true },
+                onError   = { imageLoadFailed = true },
                 onSuccess = { imageLoadFailed = false }
             )
         }
 
-        // Placeholder when no thumbnail or load failure
+        // Placeholder when no URL or load failure
         if (thumbnailUrl.isNullOrEmpty() || imageLoadFailed) {
             Box(
                 modifier = Modifier
@@ -502,25 +497,27 @@ fun InlineThumbnailPreview(
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    Icons.Default.Image,
-                    contentDescription = null,
-                    tint = TextTertiary,
-                    modifier = Modifier.size(32.dp)
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        Icons.Outlined.PlayCircle,
+                        contentDescription = null,
+                        tint = TextTertiary.copy(alpha = 0.5f),
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
             }
         }
 
-        // ── Overlay: extracting spinner / play icon / tap pulse ───────────
+        // ── Overlay ───────────────────────────────────────────────────────
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     Color.Black.copy(
                         alpha = when {
-                            isExtracting -> 0.55f
-                            pulseAlpha > 0f -> 0.1f + pulseAlpha * 0.3f
-                            else -> 0.22f
+                            isExtracting    -> 0.55f
+                            pulseAlpha > 0f -> 0.08f + pulseAlpha * 0.25f
+                            else            -> 0.18f
                         }
                     )
                 ),
@@ -533,20 +530,15 @@ fun InlineThumbnailPreview(
                         modifier = Modifier.size(28.dp),
                         strokeWidth = 2.5.dp
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        "Loading video…",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = CyberCyan,
-                        fontSize = 9.sp
-                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("Loading…", style = MaterialTheme.typography.labelSmall,
+                        color = CyberCyan, fontSize = 9.sp)
                 }
-
                 else -> Icon(
                     Icons.Default.PlayCircle,
-                    contentDescription = "Hold to play",
-                    tint = Color.White.copy(alpha = 0.92f),
-                    modifier = Modifier.size(36.dp)
+                    contentDescription = "Tap to preview",
+                    tint = Color.White.copy(alpha = 0.88f),
+                    modifier = Modifier.size(38.dp)
                 )
             }
         }
@@ -554,47 +546,233 @@ fun InlineThumbnailPreview(
         // Duration badge
         duration?.let { dur ->
             Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(4.dp),
+                modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
                 shape = RoundedCornerShape(4.dp),
-                color = Color.Black.copy(alpha = 0.7f)
+                color = Color.Black.copy(alpha = 0.72f)
             ) {
-                Text(
-                    dur,
-                    style = MaterialTheme.typography.labelSmall,
+                Text(dur, style = MaterialTheme.typography.labelSmall,
                     color = Color.White,
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
-                )
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
             }
         }
 
-        // "Hold to watch" hint badge
+        // Tap hint badge
         if (!isExtracting) {
             Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(4.dp),
+                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp),
                 shape = RoundedCornerShape(4.dp),
-                color = CyberCyan.copy(alpha = 0.75f)
+                color = CyberCyan.copy(alpha = 0.78f)
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = DarkBackground,
-                        modifier = Modifier.size(10.dp)
-                    )
+                    Icon(Icons.Default.PlayArrow, null, tint = DarkBackground,
+                        modifier = Modifier.size(10.dp))
                     Spacer(modifier = Modifier.width(2.dp))
-                    Text(
-                        "Hold",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = DarkBackground,
-                        fontSize = 8.sp
-                    )
+                    Text("Tap", style = MaterialTheme.typography.labelSmall,
+                        color = DarkBackground, fontSize = 8.sp)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * In-app WebView browser — opens a URL without leaving the results screen.
+ */
+@Composable
+fun InAppBrowserDialog(
+    url: String,
+    title: String,
+    onDismiss: () -> Unit
+) {
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = false
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(DarkBackground)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(DarkCard)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onDismiss, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Default.ArrowBack, "Back", tint = TextPrimary,
+                        modifier = Modifier.size(20.dp))
+                }
+                Text(
+                    text = title.ifEmpty { url },
+                    color = TextSecondary, fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
+                )
+                IconButton(onClick = onDismiss, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Default.Close, "Close", tint = TextTertiary,
+                        modifier = Modifier.size(18.dp))
+                }
+            }
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        webViewClient = WebViewClient()
+                        webChromeClient = WebChromeClient()
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            loadWithOverviewMode = true
+                            useWideViewPort = true
+                            builtInZoomControls = true
+                            displayZoomControls = false
+                            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                        }
+                        loadUrl(url)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+/**
+ * Full-screen thumbnail preview dialog shown when user taps a thumbnail.
+ * Displays the image large with a play button to launch video extraction.
+ */
+@Composable
+fun ThumbnailPreviewDialog(
+    thumbnailUrl: String?,
+    title: String,
+    duration: String? = null,
+    onDismiss: () -> Unit,
+    onWatch: () -> Unit,
+    onBrowser: () -> Unit
+) {
+    val context = LocalContext.current
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true
+        )
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.92f))
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null
+                ) { onDismiss() },
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(DarkCard)
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null
+                    ) { /* consume click so it doesn't dismiss */ },
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Large thumbnail
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                        .background(DarkBackground),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (!thumbnailUrl.isNullOrEmpty()) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(thumbnailUrl)
+                                .diskCachePolicy(CachePolicy.ENABLED)
+                                .memoryCachePolicy(CachePolicy.ENABLED)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Icon(Icons.Default.Videocam, null, tint = TextTertiary,
+                            modifier = Modifier.size(64.dp))
+                    }
+                    // Play button overlay
+                    Box(
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(Color.Black.copy(alpha = 0.55f))
+                            .clickable { onWatch() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.PlayArrow, "Play",
+                            tint = Color.White, modifier = Modifier.size(44.dp))
+                    }
+                    // Duration badge
+                    duration?.let {
+                        Surface(
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color.Black.copy(alpha = 0.75f)
+                        ) {
+                            Text(it, color = Color.White, fontSize = 12.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                        }
+                    }
+                }
+
+                // Title + actions
+                Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(title, color = TextPrimary, fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Button(
+                            onClick = onWatch,
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CyberCyan, contentColor = DarkBackground)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Watch", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onBrowser,
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary)
+                        ) {
+                            Icon(Icons.Default.OpenInBrowser, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Browser")
+                        }
+                        IconButton(onClick = onDismiss, modifier = Modifier.size(40.dp)) {
+                            Icon(Icons.Default.Close, "Close", tint = TextTertiary)
+                        }
+                    }
                 }
             }
         }

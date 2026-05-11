@@ -175,32 +175,32 @@ class SearchViewModel @Inject constructor(
     fun search() {
         val query = _uiState.value.query.trim()
         if (query.isEmpty()) return
-        // Do not start a new search while discovery is paused
         if (_isDiscoveryPaused.value) return
 
+        // Cancel any in-flight search immediately
         currentSearchJob?.cancel()
 
         currentSearchJob = viewModelScope.launch {
+            // ── Full fresh scrape: wipe every cache and prior result ──────
             repository.clearSearchCache()
             videoPreviewCache.clear()
-            _providerPages.value = emptyMap()
-            
-            // Reset UI state immediately for responsive feedback
-            _uiState.update { 
-                it.copy(
-                    isSearching = true, 
-                    searchCompleted = false,
-                    currentSearchQuery = query,
-                    // Reset totals and aggregated results for new search
-                    totalResults = 0,
-                    successfulProviders = 0,
-                    failedProviders = 0,
-                    aggregatedResults = null,
-                    error = null
-                ) 
-            }
-            // Clear provider results immediately
+            _providerPages.value  = emptyMap()
             _providerResults.value = emptyList()
+            _tokenResults.value    = emptyList()
+            _myAiResults.value     = emptyList()
+
+            _uiState.update {
+                it.copy(
+                    isSearching         = true,
+                    searchCompleted     = false,
+                    currentSearchQuery  = query,
+                    totalResults        = 0,
+                    successfulProviders = 0,
+                    failedProviders     = 0,
+                    aggregatedResults   = null,
+                    error               = null
+                )
+            }
             
             val results = mutableListOf<ProviderSearchResults>()
             
@@ -320,6 +320,7 @@ class SearchViewModel @Inject constructor(
     }
     
     fun searchFromHistory(query: String) {
+        // Set query then trigger a full fresh search
         _uiState.update { it.copy(query = query) }
         search()
     }

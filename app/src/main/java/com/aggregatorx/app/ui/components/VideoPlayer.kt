@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -28,74 +29,119 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
-import com.aggregatorx.app.engine.util.EngineUtils
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
+import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.smoothstreaming.SsMediaSource
 import androidx.media3.ui.PlayerView
-import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.engine.media.RecoveryStrategy
-import kotlinx.coroutines.delay
+import com.aggregatorx.app.engine.util.EngineUtils
+import com.aggregatorx.app.ui.theme.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/**
- * AggregatorX Enhanced Video Player Dialog
- * 
- * Features:
- * - Intelligent stream format detection (HLS, DASH, Progressive)
- * - Custom HTTP headers support for restricted content
- * - Automatic retry with different sources
- * - Netherlands proxy awareness
- * - Quality selection
- * - Smart error recovery
- * - Beautiful animated controls
- */
+// ── Media type detection ──────────────────────────────────────────────────────
 
-/**
- * Helper function to detect if URL is likely a playable video stream
- */
-private fun isLikelyVideoUrl(url: String): Boolean {
-    val videoIndicators = listOf(
-        ".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".avi", ".mov",
-        ".flv", ".wmv", ".ts", ".m4v", ".3gp", "/hls/", "/dash/",
-        "/video/", "/stream/", "videoplayback", "manifest"
-    )
-    val lowerUrl = url.lowercase()
-    return videoIndicators.any { lowerUrl.contains(it) }
-}
+private enum class MediaType { HLS, DASH, PROGRESSIVE, SMOOTH_STREAMING, UNKNOWN }
 
-/**
- * Detect the media type from URL for appropriate source handling.
- * Checks URL paths, query params, and common CDN patterns.
- */
 private fun detectMediaType(url: String): MediaType {
-    val lowerUrl = url.lowercase()
+    val lower = url.lowercase()
     return when {
-        lowerUrl.contains(".m3u8") -> MediaType.HLS
-        lowerUrl.contains(".mpd") -> MediaType.DASH
-        lowerUrl.contains(".mp4") || lowerUrl.contains(".webm") || 
-        lowerUrl.contains(".mkv") || lowerUrl.contains(".avi") ||
-        lowerUrl.contains(".mov") || lowerUrl.contains(".m4v") -> MediaType.PROGRESSIVE
-        lowerUrl.contains("/hls/") || lowerUrl.contains("manifest") ||
-        lowerUrl.contains("index.m3u8") || lowerUrl.contains("master.m3u8") -> MediaType.HLS
-        lowerUrl.contains("/dash/") || lowerUrl.contains("manifest.mpd") -> MediaType.DASH
-        // CDN paths that typically serve progressive video
-        lowerUrl.contains("/video/") || lowerUrl.contains("videoplayback") ||
-        lowerUrl.contains("/get_video") || lowerUrl.contains("/dl/") -> MediaType.PROGRESSIVE
+        lower.contains(".m3u8") || lower.contains("/hls/") ||
+        lower.contains("master.m3u8") || lower.contains("index.m3u8") ||
+        lower.contains("playlist.m3u8") || lower.contains("chunklist") ||
+        lower.contains("hls_playlist") || lower.contains("type=m3u8") ||
+        lower.contains("format=m3u8") -> MediaType.HLS
+
+        lower.contains(".mpd") || lower.contains("/dash/") ||
+        lower.contains("manifest.mpd") || lower.contains("stream.mpd") ||
+        lower.contains("type=mpd") || lower.contains("format=mpd") -> MediaType.DASH
+
+        (lower.contains("/manifest") && (lower.contains("ism") || lower.contains("smooth"))) ||
+        lower.endsWith("/manifest") || lower.contains(".ism/manifest") -> MediaType.SMOOTH_STREAMING
+
+        lower.contains(".mp4") || lower.contains(".webm") || lower.contains(".mkv") ||
+        lower.contains(".m4v") || lower.contains(".mov") || lower.contains(".avi") ||
+        lower.contains(".ts")  || lower.contains(".flv") || lower.contains(".wmv") ||
+        lower.contains(".3gp") || lower.contains(".f4v") || lower.contains(".ogv") ||
+        lower.contains(".mp3") || lower.contains(".aac") || lower.contains(".ogg") ||
+        lower.contains(".flac")|| lower.contains(".wav") || lower.contains(".m4a") -> MediaType.PROGRESSIVE
+
+        lower.contains("videoplayback") || lower.contains("/get_video") ||
+        lower.contains("/dl/") || lower.contains("googlevideo.com") ||
+        lower.contains("akamaized.net") || lower.contains("cloudfront.net") ||
+        lower.contains("cdn.streamtape") || lower.contains("dood.") ||
+        lower.contains("filemoon.") || lower.contains("streamwish.") ||
+        lower.contains("mixdrop.") || lower.contains("voe.sx") ||
+        lower.contains("upstream.to") || lower.contains("streamlare.") ||
+        lower.contains("vidplay.") || lower.contains("mp4upload.") ||
+        lower.contains("sendvid.") || lower.contains("streamable.") -> MediaType.PROGRESSIVE
+
         else -> MediaType.UNKNOWN
     }
 }
 
-private enum class MediaType {
-    HLS, DASH, PROGRESSIVE, UNKNOWN
+private val FORMAT_RETRY_ORDER = listOf(
+    MediaType.PROGRESSIVE, MediaType.HLS, MediaType.DASH, MediaType.SMOOTH_STREAMING
+)
+
+private fun buildMediaSource(
+    uri: Uri,
+    type: MediaType,
+    factory: DefaultHttpDataSource.Factory
+): androidx.media3.exoplayer.source.MediaSource = when (type) {
+    MediaType.HLS ->
+        HlsMediaSource.Factory(factory)
+            .setAllowChunklessPreparation(true)
+            .createMediaSource(MediaItem.fromUri(uri))
+    MediaType.DASH ->
+        DashMediaSource.Factory(factory)
+            .createMediaSource(MediaItem.fromUri(uri))
+    MediaType.SMOOTH_STREAMING ->
+        SsMediaSource.Factory(factory)
+            .createMediaSource(MediaItem.fromUri(uri))
+    MediaType.PROGRESSIVE, MediaType.UNKNOWN ->
+        ProgressiveMediaSource.Factory(factory)
+            .createMediaSource(MediaItem.fromUri(uri))
 }
+
+private fun mapErrorToRecovery(code: Int): RecoveryStrategy? = when (code) {
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS            -> RecoveryStrategy.USE_NETHERLANDS_PROXY
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED  -> RecoveryStrategy.TRY_PROXY
+    PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED    -> RecoveryStrategy.TRY_ALTERNATE_SOURCE
+    else                                                        -> RecoveryStrategy.TRY_ALL_METHODS
+}
+
+private fun isNetworkError(code: Int) = code in listOf(
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+    PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW
+)
+
+private fun friendlyError(code: Int, raw: String?): String = when (code) {
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED  -> "Network connection failed"
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> "Connection timed out"
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS            -> "Stream unavailable (HTTP error)"
+    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND             -> "Stream not found (404)"
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE  -> "Invalid content type"
+    PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED    -> "Malformed stream manifest"
+    PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED  -> "Unsupported manifest format"
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> "Unsupported video container"
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED   -> "Corrupted video data"
+    PlaybackException.ERROR_CODE_DECODING_FAILED               -> "Decoding failed"
+    PlaybackException.ERROR_CODE_DECODER_INIT_FAILED           -> "Decoder unavailable"
+    PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW            -> "Behind live window — restarting"
+    else -> raw?.take(120) ?: "Playback error ($code)"
+}
+
+// ── VideoPlayerDialog ─────────────────────────────────────────────────────────
 
 @Composable
 fun VideoPlayerDialog(
@@ -108,207 +154,100 @@ fun VideoPlayerDialog(
     onStreamError: ((String, RecoveryStrategy?) -> Unit)? = null
 ) {
     val context = LocalContext.current
-    var isPlaying by remember { mutableStateOf(true) }
+
+    var isPlaying       by remember { mutableStateOf(true) }
     var currentPosition by remember { mutableStateOf(0L) }
-    var duration by remember { mutableStateOf(0L) }
-    var isBuffering by remember { mutableStateOf(true) }
-    var hasError by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf("") }
-    var showControls by remember { mutableStateOf(true) }
-    var retryCount by remember { mutableStateOf(0) }
-    var currentQuality by remember { mutableStateOf("Auto") }
-    var showProxyBadge by remember { mutableStateOf(false) }
-    
-    // Track which media types have been tried (for auto-format switching)
-    var triedFormats by remember { mutableStateOf(setOf<MediaType>()) }
-    var currentFormatOverride by remember { mutableStateOf<MediaType?>(null) }
-    
-    // Check if URL is likely a valid video URL
-    val detectedMediaType = remember(videoUrl) { detectMediaType(videoUrl) }
-    val activeMediaType = currentFormatOverride ?: detectedMediaType
-    val isLikelyValid = remember(videoUrl) { isLikelyVideoUrl(videoUrl) }
-    
-    // For UNKNOWN types, always try Progressive first — ExoPlayer will determine the format.
-    // Do NOT show an early error; many valid CDN URLs have no extension at all.
-    
-    // Create HTTP data source with optimized settings for faster loading
-    val httpDataSourceFactory = remember(videoUrl, headers) {
-        val ua = headers?.get("User-Agent")
-            ?: EngineUtils.DEFAULT_USER_AGENT
+    var duration        by remember { mutableStateOf(0L) }
+    var isBuffering     by remember { mutableStateOf(true) }
+    var bufferPercent   by remember { mutableStateOf(0) }
+    var hasError        by remember { mutableStateOf(false) }
+    var errorMessage    by remember { mutableStateOf("") }
+    var showControls    by remember { mutableStateOf(true) }
+    var retryCount      by remember { mutableStateOf(0) }
+    var triedFormats    by remember { mutableStateOf(setOf<MediaType>()) }
+    var formatOverride  by remember { mutableStateOf<MediaType?>(null) }
+    var playbackSpeed   by remember { mutableStateOf(1.0f) }
+    var showSpeedMenu   by remember { mutableStateOf(false) }
+
+    val detectedType = remember(videoUrl) { detectMediaType(videoUrl) }
+    val activeType   = formatOverride ?: detectedType
+
+    val httpFactory = remember(videoUrl, headers) {
+        val ua = headers?.get("User-Agent") ?: EngineUtils.DEFAULT_USER_AGENT
         DefaultHttpDataSource.Factory()
             .setUserAgent(ua)
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(30000)
+            .setConnectTimeoutMs(20_000)
+            .setReadTimeoutMs(40_000)
             .setAllowCrossProtocolRedirects(true)
-            .apply {
-                headers?.let { hdrs ->
-                    setDefaultRequestProperties(hdrs)
-                }
-            }
+            .apply { headers?.let { setDefaultRequestProperties(it) } }
     }
-    
-    // Optimized load control for faster playback start (2026 network speeds)
+
     val loadControl = remember {
         DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                1500,   // Min buffer before playback starts (1.5s — fast fast-forward on modern connections)
-                60000,  // Max buffer size (60s ahead)
-                600,    // Buffer for resuming from stall (very responsive)
-                1500    // Buffer for rebuffering
-            )
-            .setPrioritizeTimeOverSizeThresholds(true)  // Always prioritize faster start
-            .setTargetBufferBytes(8 * 1024 * 1024)      // 8 MB target buffer
+            .setBufferDurationsMs(1_500, 60_000, 600, 1_500)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .setTargetBufferBytes(8 * 1024 * 1024)
             .build()
     }
-    
-    // Create appropriate media source based on URL — always attempt playback
-    val exoPlayer = remember(videoUrl, retryCount, activeMediaType) {
-        if (hasError && triedFormats.size >= 3) null
-        else ExoPlayer.Builder(context)
-            .setLoadControl(loadControl)  // Use optimized load control
-            .setSeekBackIncrementMs(10000)
-            .setSeekForwardIncrementMs(10000)
+
+    val exoPlayer = remember(videoUrl, retryCount, activeType) {
+        ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .setSeekBackIncrementMs(10_000)
+            .setSeekForwardIncrementMs(10_000)
             .build().apply {
-                val mediaSource = when (activeMediaType) {
-                    MediaType.HLS -> {
-                        // HLS Stream
-                        HlsMediaSource.Factory(httpDataSourceFactory)
-                            .setAllowChunklessPreparation(true)
-                            .createMediaSource(MediaItem.fromUri(Uri.parse(videoUrl)))
-                    }
-                    MediaType.DASH -> {
-                        // DASH Stream
-                        DashMediaSource.Factory(httpDataSourceFactory)
-                            .createMediaSource(MediaItem.fromUri(Uri.parse(videoUrl)))
-                    }
-                    MediaType.PROGRESSIVE, MediaType.UNKNOWN -> {
-                        // Progressive (MP4, WebM, etc.) or try as progressive for unknown
-                        ProgressiveMediaSource.Factory(httpDataSourceFactory)
-                            .createMediaSource(MediaItem.fromUri(Uri.parse(videoUrl)))
-                    }
-                }
-                setMediaSource(mediaSource)
+                val source = buildMediaSource(Uri.parse(videoUrl), activeType, httpFactory)
+                setMediaSource(source)
                 prepare()
                 playWhenReady = true
             }
     }
-    
-    // Player listener with enhanced error handling
+
     DisposableEffect(exoPlayer) {
-        if (exoPlayer == null) {
-            onDispose { }
-        } else {
-            val listener = object : Player.Listener {
-                override fun onPlaybackStateChanged(playbackState: Int) {
-                    isBuffering = playbackState == Player.STATE_BUFFERING
-                    if (playbackState == Player.STATE_READY) {
-                        duration = exoPlayer.duration
-                        hasError = false // Clear error on successful playback
-                    }
-                }
-                
-                override fun onIsPlayingChanged(playing: Boolean) {
-                    isPlaying = playing
-                }
-                
-                override fun onPlayerError(error: PlaybackException) {
-                    val errorCode = error.errorCode
-                    val errorMsg = when (errorCode) {
-                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> 
-                            "Network connection failed - Check your connection"
-                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> 
-                            "Connection timeout - Server may be slow"
-                        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> 
-                            "Source unavailable (${error.message}) - Trying alternate source..."
-                        PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE -> 
-                            "Invalid content type - Trying different format..."
-                        PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED -> 
-                            "Stream manifest error - Trying direct playback..."
-                        PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED -> 
-                            "Unsupported stream format - Trying alternate format..."
-                        PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW -> 
-                            "Behind live window - Restarting stream..."
-                        PlaybackException.ERROR_CODE_DECODING_FAILED,
-                        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ->
-                            "Decoder error - This content format is not supported"
-                        PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
-                        PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ->
-                            "Invalid video format - Trying alternate format..."
-                        else -> error.message ?: "Playback error (code: $errorCode)"
-                    }
-                    
-                    // Determine recovery strategy
-                    val recovery = when (errorCode) {
-                        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> RecoveryStrategy.USE_NETHERLANDS_PROXY
-                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> RecoveryStrategy.TRY_PROXY
-                        PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED -> RecoveryStrategy.TRY_ALTERNATE_SOURCE
-                        else -> RecoveryStrategy.TRY_ALL_METHODS
-                    }
-                    
-                    // Notify parent for stream recovery
-                    onStreamError?.invoke(errorMsg, recovery)
-                    
-                    // AUTO FORMAT SWITCHING: Try different media types before showing error
-                    // Track this format as tried
-                    triedFormats = triedFormats + activeMediaType
-                    
-                    // Determine which format to try next
-                    val formatOrder = listOf(MediaType.PROGRESSIVE, MediaType.HLS, MediaType.DASH)
-                    val nextFormat = formatOrder.firstOrNull { it !in triedFormats }
-                    
-                    if (nextFormat != null) {
-                        // Auto-switch to next format
-                        CoroutineScope(Dispatchers.Main).launch {
-                            delay(500)
-                            currentFormatOverride = nextFormat
-                            hasError = false
-                            retryCount++ // Trigger recomposition
-                        }
-                    } else if (retryCount < 3 && errorCode in listOf(
-                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
-                        PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW
-                    )) {
-                        // All formats tried, but network errors can be retried
-                        CoroutineScope(Dispatchers.Main).launch {
-                            delay(2000)
-                            // Reset format attempts for network retries
-                            triedFormats = emptySet()
-                            currentFormatOverride = null
-                            retryCount++
-                        }
-                    } else {
-                        // All formats tried and all retries exhausted
-                        hasError = true
-                        errorMessage = "Unable to play this video stream. The source may be geo-restricted, expired, or incompatible."
-                    }
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                isBuffering   = state == Player.STATE_BUFFERING
+                bufferPercent = exoPlayer.bufferedPercentage
+                if (state == Player.STATE_READY) {
+                    duration = exoPlayer.duration.takeIf { it != C.TIME_UNSET } ?: 0L
+                    hasError = false
                 }
             }
-            
-            exoPlayer.addListener(listener)
-            
-            onDispose {
-                exoPlayer.removeListener(listener)
-                exoPlayer.release()
+            override fun onIsPlayingChanged(playing: Boolean) { isPlaying = playing }
+            override fun onPlayerError(error: PlaybackException) {
+                onStreamError?.invoke(error.message ?: "Playback error", mapErrorToRecovery(error.errorCode))
+                triedFormats = triedFormats + activeType
+                val next = FORMAT_RETRY_ORDER.firstOrNull { it !in triedFormats }
+                if (next != null) {
+                    CoroutineScope(Dispatchers.Main).launch {
+                        delay(400); formatOverride = next; hasError = false; retryCount++
+                    }
+                } else if (retryCount < 2 && isNetworkError(error.errorCode)) {
+                    CoroutineScope(Dispatchers.Main).launch {
+                        delay(2_000); triedFormats = emptySet(); formatOverride = null; retryCount++
+                    }
+                } else {
+                    hasError = true
+                    errorMessage = friendlyError(error.errorCode, error.message)
+                }
             }
         }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener); exoPlayer.release() }
     }
-    
-    // Update position
-    LaunchedEffect(isPlaying, exoPlayer) {
-        while (isPlaying && exoPlayer != null) {
+
+    LaunchedEffect(isPlaying) {
+        while (isPlaying) {
             currentPosition = exoPlayer.currentPosition
+            bufferPercent   = exoPlayer.bufferedPercentage
             delay(500)
         }
     }
-    
-    // Auto-hide controls
-    LaunchedEffect(showControls) {
-        if (showControls && isPlaying) {
-            delay(3000)
-            showControls = false
-        }
+
+    LaunchedEffect(showControls, isPlaying) {
+        if (showControls && isPlaying) { delay(3_500); showControls = false }
     }
-    
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -324,162 +263,56 @@ fun VideoPlayerDialog(
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
-                ) {
-                    showControls = !showControls
-                }
+                ) { showControls = !showControls }
         ) {
             if (hasError) {
-                // Enhanced Error state with recovery options
                 Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(
-                                    DarkBackground,
-                                    DarkSurface,
-                                    DarkBackground
-                                )
-                            )
-                        )
-                        .padding(32.dp),
+                    modifier = Modifier.fillMaxSize().background(DarkBackground).padding(32.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
-                    // Error icon with glow effect
                     Box(
-                        modifier = Modifier
-                            .size(80.dp)
-                            .background(
-                                AccentRed.copy(alpha = 0.15f),
-                                CircleShape
-                            )
-                            .padding(12.dp),
+                        modifier = Modifier.size(80.dp)
+                            .background(AccentRed.copy(alpha = 0.15f), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Error,
-                            contentDescription = null,
-                            tint = AccentRed,
-                            modifier = Modifier.size(48.dp)
-                        )
+                        Icon(Icons.Default.ErrorOutline, null, tint = AccentRed,
+                            modifier = Modifier.size(48.dp))
                     }
-                    
-                    Spacer(modifier = Modifier.height(24.dp))
-                    
-                    Text(
-                        text = "Playback Error",
-                        style = MaterialTheme.typography.headlineMedium.copy(
-                            fontWeight = FontWeight.Bold
-                        ),
-                        color = TextPrimary
-                    )
-                    
-                    Spacer(modifier = Modifier.height(12.dp))
-                    
-                    Text(
-                        text = errorMessage,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(horizontal = 16.dp)
-                    )
-                    
-                    if (retryCount > 0) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Retry attempt: $retryCount/3",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = CyberCyan
-                        )
-                    }
-                    
-                    Spacer(modifier = Modifier.height(32.dp))
-                    
-                    // Recovery action buttons
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        // Retry button
+                    Spacer(Modifier.height(20.dp))
+                    Text("Playback Error", style = MaterialTheme.typography.headlineSmall,
+                        color = TextPrimary, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(10.dp))
+                    Text(errorMessage, style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary)
+                    Spacer(Modifier.height(28.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
-                            onClick = { 
-                                // Reset format tracking on manual retry
-                                triedFormats = emptySet()
-                                currentFormatOverride = null
-                                hasError = false
-                                retryCount++ 
+                            onClick = {
+                                triedFormats = emptySet(); formatOverride = null
+                                hasError = false; retryCount++
                             },
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = CyberCyan,
-                                contentColor = DarkBackground
-                            ),
-                            modifier = Modifier.height(48.dp)
+                                containerColor = CyberCyan, contentColor = DarkBackground)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Retry",
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp)); Text("Retry")
                         }
-                        
-                        // Open in browser button — always available as escape hatch
                         Button(
                             onClick = onOpenExternal,
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = AIAccent,
-                                contentColor = DarkBackground
-                            ),
-                            modifier = Modifier.height(48.dp)
+                                containerColor = NeonGreen, contentColor = DarkBackground)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.OpenInBrowser,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Browser",
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            Icon(Icons.Default.OpenInBrowser, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp)); Text("Browser")
                         }
-                        
-                        // Close button
-                        OutlinedButton(
-                            onClick = onDismiss,
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = TextPrimary
-                            ),
-                            modifier = Modifier.height(48.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Close",
-                                fontWeight = FontWeight.Medium
-                            )
+                        OutlinedButton(onClick = onDismiss,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary)) {
+                            Text("Close")
                         }
                     }
-                    
-                    Spacer(modifier = Modifier.height(24.dp))
-                    
-                    // Hint text
-                    Text(
-                        text = "💡 Tip: Try enabling Netherlands proxy in Settings for geo-restricted content",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = AIAccent,
-                        modifier = Modifier.padding(horizontal = 24.dp)
-                    )
                 }
-            } else if (exoPlayer != null) {
-                // Video player - only show if we have a valid player
+            } else {
                 AndroidView(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
@@ -493,163 +326,127 @@ fun VideoPlayerDialog(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
-                
-                // Buffering indicator
+
                 if (isBuffering) {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(
-                            color = CyberCyan,
-                            modifier = Modifier.size(64.dp)
-                        )
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(color = CyberCyan,
+                                modifier = Modifier.size(56.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Text("$bufferPercent%", color = Color.White.copy(alpha = 0.7f),
+                                fontSize = 12.sp)
+                        }
                     }
                 }
-                
-                // Controls overlay
-                AnimatedVisibility(
-                    visible = showControls,
-                    enter = fadeIn(),
-                    exit = fadeOut()
-                ) {
+
+                AnimatedVisibility(visible = showControls, enter = fadeIn(), exit = fadeOut()) {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(
-                                        Color.Black.copy(alpha = 0.7f),
-                                        Color.Transparent,
-                                        Color.Transparent,
-                                        Color.Black.copy(alpha = 0.7f)
-                                    )
-                                )
-                            )
+                        modifier = Modifier.fillMaxSize().background(
+                            Brush.verticalGradient(listOf(
+                                Color.Black.copy(alpha = 0.75f), Color.Transparent,
+                                Color.Transparent, Color.Black.copy(alpha = 0.75f)
+                            ))
+                        )
                     ) {
                         // Top bar
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp)
+                            modifier = Modifier.fillMaxWidth().padding(12.dp)
                                 .align(Alignment.TopCenter),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             IconButton(onClick = onDismiss) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Close",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(28.dp)
-                                )
+                                Icon(Icons.Default.Close, "Close", tint = Color.White,
+                                    modifier = Modifier.size(26.dp))
                             }
-                            
-                            Text(
-                                text = title,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White,
-                                maxLines = 1,
-                                modifier = Modifier.weight(1f)
-                            )
-                            
+                            Text(title, color = Color.White, fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp))
+                            Box {
+                                IconButton(onClick = { showSpeedMenu = true }) {
+                                    Text(
+                                        if (playbackSpeed == 1.0f) "1×" else "${playbackSpeed}×",
+                                        color = CyberCyan, fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                DropdownMenu(expanded = showSpeedMenu,
+                                    onDismissRequest = { showSpeedMenu = false },
+                                    modifier = Modifier.background(DarkCard)) {
+                                    listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f)
+                                        .forEach { speed ->
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(
+                                                        if (speed == 1.0f) "Normal" else "${speed}×",
+                                                        color = if (speed == playbackSpeed) CyberCyan else TextPrimary
+                                                    )
+                                                },
+                                                onClick = {
+                                                    playbackSpeed = speed
+                                                    exoPlayer.setPlaybackSpeed(speed)
+                                                    showSpeedMenu = false
+                                                }
+                                            )
+                                        }
+                                }
+                            }
                             IconButton(onClick = onDownload) {
-                                Icon(
-                                    imageVector = Icons.Default.Download,
-                                    contentDescription = "Download",
-                                    tint = CyberCyan,
-                                    modifier = Modifier.size(28.dp)
-                                )
+                                Icon(Icons.Default.Download, "Download", tint = CyberCyan,
+                                    modifier = Modifier.size(24.dp))
                             }
                         }
-                        
-                        // Center controls: Skip Back | Play/Pause | Skip Forward
+
+                        // Centre transport
                         Row(
                             modifier = Modifier.align(Alignment.Center),
-                            horizontalArrangement = Arrangement.spacedBy(24.dp),
+                            horizontalArrangement = Arrangement.spacedBy(20.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // Skip back 10s
-                            Box(
-                                modifier = Modifier
-                                    .size(52.dp)
-                                    .clip(CircleShape)
-                                    .background(Color.Black.copy(alpha = 0.5f))
-                                    .clickable {
-                                        exoPlayer?.let { player ->
-                                            player.seekTo(maxOf(0, player.currentPosition - 10000))
-                                        }
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) {
+                            TransportBtn(48.dp, {
+                                exoPlayer.seekTo(maxOf(0L, exoPlayer.currentPosition - 30_000L))
+                            }) { Icon(Icons.Default.Replay30, "-30s", tint = Color.White,
+                                modifier = Modifier.size(26.dp)) }
+                            TransportBtn(48.dp, {
+                                exoPlayer.seekTo(maxOf(0L, exoPlayer.currentPosition - 10_000L))
+                            }) { Icon(Icons.Default.Replay10, "-10s", tint = Color.White,
+                                modifier = Modifier.size(26.dp)) }
+                            TransportBtn(68.dp, {
+                                if (isPlaying) exoPlayer.pause() else exoPlayer.play()
+                            }) {
                                 Icon(
-                                    imageVector = Icons.Default.Replay10,
-                                    contentDescription = "Skip back 10s",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(32.dp)
+                                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    if (isPlaying) "Pause" else "Play",
+                                    tint = Color.White, modifier = Modifier.size(42.dp)
                                 )
                             }
-                            
-                            // Play/Pause
-                            Box(
-                                modifier = Modifier
-                                    .size(72.dp)
-                                    .clip(CircleShape)
-                                    .background(Color.Black.copy(alpha = 0.5f))
-                                    .clickable {
-                                        exoPlayer?.let { player ->
-                                            if (isPlaying) {
-                                                player.pause()
-                                            } else {
-                                                player.play()
-                                            }
-                                        }
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = if (isPlaying) "Pause" else "Play",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                            }
-                            
-                            // Skip forward 10s
-                            Box(
-                                modifier = Modifier
-                                    .size(52.dp)
-                                    .clip(CircleShape)
-                                    .background(Color.Black.copy(alpha = 0.5f))
-                                    .clickable {
-                                        exoPlayer?.let { player ->
-                                            player.seekTo(minOf(player.duration, player.currentPosition + 10000))
-                                        }
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Forward10,
-                                    contentDescription = "Skip forward 10s",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(32.dp)
-                                )
-                            }
+                            TransportBtn(48.dp, {
+                                val dur = exoPlayer.duration.takeIf { it != C.TIME_UNSET } ?: Long.MAX_VALUE
+                                exoPlayer.seekTo(minOf(dur, exoPlayer.currentPosition + 10_000L))
+                            }) { Icon(Icons.Default.Forward10, "+10s", tint = Color.White,
+                                modifier = Modifier.size(26.dp)) }
+                            TransportBtn(48.dp, {
+                                val dur = exoPlayer.duration.takeIf { it != C.TIME_UNSET } ?: Long.MAX_VALUE
+                                exoPlayer.seekTo(minOf(dur, exoPlayer.currentPosition + 30_000L))
+                            }) { Icon(Icons.Default.Forward30, "+30s", tint = Color.White,
+                                modifier = Modifier.size(26.dp)) }
                         }
-                        
-                        // Bottom controls
+
+                        // Bottom seek + time
                         Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .align(Alignment.BottomCenter)
-                                .padding(16.dp)
+                            modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter)
+                                .padding(horizontal = 16.dp, vertical = 12.dp)
                         ) {
-                            // Progress bar
+                            LinearProgressIndicator(
+                                progress = { bufferPercent / 100f },
+                                modifier = Modifier.fillMaxWidth().height(2.dp),
+                                color = Color.White.copy(alpha = 0.3f),
+                                trackColor = Color.Transparent
+                            )
                             Slider(
-                                value = if (duration > 0) currentPosition.toFloat() / duration.toFloat() else 0f,
-                                onValueChange = { value ->
-                                    exoPlayer?.seekTo((value * duration).toLong())
-                                },
+                                value = if (duration > 0) currentPosition.toFloat() / duration else 0f,
+                                onValueChange = { exoPlayer.seekTo((it * duration).toLong()) },
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = SliderDefaults.colors(
                                     thumbColor = CyberCyan,
@@ -657,22 +454,14 @@ fun VideoPlayerDialog(
                                     inactiveTrackColor = Color.White.copy(alpha = 0.3f)
                                 )
                             )
-                            
-                            // Time display
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text(
-                                    text = formatDuration(currentPosition),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White
-                                )
-                                Text(
-                                    text = formatDuration(duration),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White
-                                )
+                                Text(formatDuration(currentPosition), color = Color.White,
+                                    fontSize = 12.sp)
+                                Text(formatDuration(duration), color = Color.White,
+                                    fontSize = 12.sp)
                             }
                         }
                     }
@@ -682,18 +471,23 @@ fun VideoPlayerDialog(
     }
 }
 
-/**
- * Format duration to mm:ss or hh:mm:ss
- */
+@Composable
+private fun TransportBtn(
+    size: androidx.compose.ui.unit.Dp,
+    onClick: () -> Unit,
+    content: @Composable BoxScope.() -> Unit
+) {
+    Box(
+        modifier = Modifier.size(size).clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.5f)).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+        content = content
+    )
+}
+
 private fun formatDuration(millis: Long): String {
-    val totalSeconds = millis / 1000
-    val hours = totalSeconds / 3600
-    val minutes = (totalSeconds % 3600) / 60
-    val seconds = totalSeconds % 60
-    
-    return if (hours > 0) {
-        String.format("%d:%02d:%02d", hours, minutes, seconds)
-    } else {
-        String.format("%d:%02d", minutes, seconds)
-    }
+    if (millis <= 0L) return "0:00"
+    val s = millis / 1000
+    val h = s / 3600; val m = (s % 3600) / 60; val sec = s % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }

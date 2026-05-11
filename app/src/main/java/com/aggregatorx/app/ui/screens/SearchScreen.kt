@@ -40,6 +40,7 @@ import com.aggregatorx.app.ui.viewmodel.VideoExtractionState
 import com.aggregatorx.app.ui.viewmodel.VideoPreviewResult
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.unit.IntOffset
 
 // Quick-tab sentinel IDs
 private const val TAB_TOP    = "__TOP__"
@@ -69,71 +70,51 @@ fun SearchScreen(
 
     var activeTab by remember { mutableStateOf(TAB_TOP) }
 
-    val isScrolled = remember { derivedStateOf {
-        listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 60
-    }}
-    val hasResults     = providerResults.isNotEmpty()
-    val collapseHeader = hasResults && isScrolled.value
+    val hasResults = providerResults.isNotEmpty()
+
+    // ── Scroll-direction tracking: hide header on scroll-down, show on scroll-up ──
+    var prevFirstIndex   by remember { mutableStateOf(0) }
+    var prevScrollOffset by remember { mutableStateOf(0) }
+    var headerVisible    by remember { mutableStateOf(true) }
+
+    LaunchedEffect(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset) {
+        val idx = listState.firstVisibleItemIndex
+        val off = listState.firstVisibleItemScrollOffset
+        if (hasResults) {
+            when {
+                idx > prevFirstIndex                  -> headerVisible = false
+                idx < prevFirstIndex                  -> headerVisible = true
+                off > prevScrollOffset + 12           -> headerVisible = false
+                off < prevScrollOffset - 12           -> headerVisible = true
+            }
+        } else {
+            headerVisible = true
+        }
+        prevFirstIndex   = idx
+        prevScrollOffset = off
+    }
+
+    // Slide the header panel up/down
+    val headerOffsetY by animateIntAsState(
+        targetValue    = if (headerVisible) 0 else -400,
+        animationSpec  = tween(durationMillis = 240, easing = FastOutSlowInEasing),
+        label          = "header_slide"
+    )
+    // Shrink the top padding for the content area when header is hidden
+    val contentTopPad by animateDpAsState(
+        targetValue   = if (headerVisible) 152.dp else 0.dp,
+        animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing),
+        label         = "content_top_pad"
+    )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBackground)
     ) {
+        // ── SCROLLABLE CONTENT ────────────────────────────────────────────
         Column(modifier = Modifier.fillMaxSize()) {
-
-            // ── FIXED NEON SEARCH BAR ────────────────────────────────────
-            NeonSearchBar(
-                query         = uiState.query,
-                onQueryChange = viewModel::updateQuery,
-                onSearch      = viewModel::search,
-                isLoading     = uiState.isSearching,
-                isPaused      = isPaused,
-                modifier      = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-            )
-
-            // ── QUICK-TABS ROW ───────────────────────────────────────────
-            QuickTabsRow(
-                activeTab       = activeTab,
-                providerResults = providerResults,
-                onTabSelected   = { tab ->
-                    activeTab = tab
-                    scope.launch { listState.animateScrollToItem(0) }
-                }
-            )
-
-            // ── PAUSE BANNER ─────────────────────────────────────────────
-            AnimatedVisibility(visible = isPaused) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(AccentOrange.copy(alpha = 0.12f))
-                        .padding(horizontal = 16.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Filled.Pause, null, tint = AccentOrange, modifier = Modifier.size(13.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        "DISCOVERY PAUSED — feed frozen",
-                        color = AccentOrange, fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold, letterSpacing = 1.sp
-                    )
-                }
-            }
-
-            // ── STATS BAR ────────────────────────────────────────────────
-            AnimatedVisibility(
-                visible = (uiState.searchCompleted || uiState.isSearching) && !collapseHeader
-            ) {
-                SearchStatsBar(
-                    totalResults        = uiState.totalResults,
-                    successfulProviders = uiState.successfulProviders,
-                    failedProviders     = uiState.failedProviders,
-                    isSearching         = uiState.isSearching
-                )
-            }
-
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(contentTopPad))
 
             // ── CONTENT ──────────────────────────────────────────────────
             when {
@@ -333,6 +314,57 @@ fun SearchScreen(
             }
 
             else -> Unit // Idle — nothing to show
+        }
+
+        // ── FLOATING HEADER (slides up on scroll-down, back on scroll-up) ──
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .offset { IntOffset(x = 0, y = headerOffsetY) }
+                .background(DarkBackground.copy(alpha = 0.97f))
+        ) {
+            NeonSearchBar(
+                query         = uiState.query,
+                onQueryChange = viewModel::updateQuery,
+                onSearch      = viewModel::search,
+                isLoading     = uiState.isSearching,
+                isPaused      = isPaused,
+                modifier      = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+            )
+            QuickTabsRow(
+                activeTab       = activeTab,
+                providerResults = providerResults,
+                onTabSelected   = { tab ->
+                    activeTab = tab
+                    scope.launch { listState.animateScrollToItem(0) }
+                }
+            )
+            AnimatedVisibility(visible = isPaused) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(AccentOrange.copy(alpha = 0.12f))
+                        .padding(horizontal = 16.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.Pause, null, tint = AccentOrange, modifier = Modifier.size(13.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "DISCOVERY PAUSED — feed frozen",
+                        color = AccentOrange, fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = 1.sp
+                    )
+                }
+            }
+            AnimatedVisibility(visible = uiState.searchCompleted || uiState.isSearching) {
+                SearchStatsBar(
+                    totalResults        = uiState.totalResults,
+                    successfulProviders = uiState.successfulProviders,
+                    failedProviders     = uiState.failedProviders,
+                    isSearching         = uiState.isSearching
+                )
+            }
         }
 
     }
@@ -790,10 +822,35 @@ fun ShieldedResultCard(
 ) {
     val scope = rememberCoroutineScope()
 
-    // Inline preview state: null = not started, "" = extracting, else = URL
-    var inlineVideoUrl  by remember(result.url) { mutableStateOf<String?>(null) }
-    var isExtracting    by remember(result.url) { mutableStateOf(false) }
+    // Inline video player state
+    var inlineVideoUrl   by remember(result.url) { mutableStateOf<String?>(null) }
+    var inlineHeaders    by remember(result.url) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var isExtracting     by remember(result.url) { mutableStateOf(false) }
     var showInlinePlayer by remember(result.url) { mutableStateOf(false) }
+
+    // Thumbnail tap → full preview dialog
+    var showThumbnailPreview by remember(result.url) { mutableStateOf(false) }
+
+    // In-app browser (keeps user on results screen)
+    var showInAppBrowser by remember(result.url) { mutableStateOf(false) }
+
+    // Helper: extract video then show inline player
+    fun extractAndPlayInline() {
+        if (inlineVideoUrl != null) {
+            showInlinePlayer = true
+            return
+        }
+        if (isExtracting) return
+        isExtracting = true
+        scope.launch {
+            val preview = onExtractVideoForPreview?.invoke(result.url)
+            inlineVideoUrl = preview?.videoUrl
+            inlineHeaders  = preview?.headers ?: emptyMap()
+            isExtracting   = false
+            if (!inlineVideoUrl.isNullOrEmpty()) showInlinePlayer = true
+            else onWatch()
+        }
+    }
 
     Surface(
         modifier = modifier
@@ -808,38 +865,19 @@ fun ShieldedResultCard(
             // ── THUMBNAIL + TITLE ROW ─────────────────────────────────────
             Row(verticalAlignment = Alignment.Top) {
 
-                // Thumbnail (shown when available; tapping starts inline preview)
-                if (!result.thumbnailUrl.isNullOrEmpty()) {
-                    InlineThumbnailPreview(
-                        thumbnailUrl     = result.thumbnailUrl,
-                        duration         = result.duration,
-                        isExtracting     = isExtracting,
-                        onHoldFullscreen = {
-                            // Long-press → extract and play inline
-                            if (inlineVideoUrl != null) {
-                                showInlinePlayer = true
-                            } else if (!isExtracting && onExtractVideoForPreview != null) {
-                                isExtracting = true
-                                scope.launch {
-                                    val preview = onExtractVideoForPreview(result.url)
-                                    inlineVideoUrl = preview?.videoUrl
-                                    isExtracting   = false
-                                    if (!inlineVideoUrl.isNullOrEmpty()) {
-                                        showInlinePlayer = true
-                                    }
-                                }
-                            } else {
-                                // Fallback: trigger the full Watch flow
-                                onWatch()
-                            }
-                        },
-                        modifier = Modifier
-                            .width(100.dp)
-                            .height(70.dp)
-                            .clip(RoundedCornerShape(6.dp))
-                    )
-                    Spacer(Modifier.width(10.dp))
-                }
+                // Thumbnail — always shown (placeholder when no URL available)
+                InlineThumbnailPreview(
+                    thumbnailUrl     = result.thumbnailUrl,
+                    duration         = result.duration,
+                    isExtracting     = isExtracting,
+                    onTapPreview     = { showThumbnailPreview = true },
+                    onHoldFullscreen = { extractAndPlayInline() },
+                    modifier = Modifier
+                        .width(120.dp)
+                        .height(90.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+                Spacer(Modifier.width(10.dp))
 
                 // Title + provider + quality badge
                 Column(modifier = Modifier.weight(1f)) {
@@ -858,7 +896,6 @@ fun ShieldedResultCard(
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                         }
-                        // Quality badge
                         val quality = result.quality ?: ""
                         if (quality.isNotEmpty()) {
                             Spacer(Modifier.width(6.dp))
@@ -877,7 +914,6 @@ fun ShieldedResultCard(
                         }
                     }
 
-                    // Metadata: duration, size, seeds
                     val meta = buildList {
                         result.duration?.let { add("⏱ $it") }
                         result.size?.let { add("💾 $it") }
@@ -886,15 +922,13 @@ fun ShieldedResultCard(
                     if (meta.isNotEmpty()) {
                         Spacer(Modifier.height(5.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            meta.forEach { m ->
-                                Text(m, color = TextTertiary, fontSize = 10.sp)
-                            }
+                            meta.forEach { m -> Text(m, color = TextTertiary, fontSize = 10.sp) }
                         }
                     }
                 }
             }
 
-            // ── INLINE VIDEO PLAYER (tap-on-thumbnail preview) ────────────
+            // ── INLINE VIDEO PLAYER ───────────────────────────────────────
             AnimatedVisibility(
                 visible = showInlinePlayer && !inlineVideoUrl.isNullOrEmpty(),
                 enter   = expandVertically() + fadeIn(),
@@ -906,42 +940,31 @@ fun ShieldedResultCard(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(200.dp)
+                            .height(210.dp)
                             .clip(RoundedCornerShape(8.dp))
                     ) {
                         InlineExoPlayerView(
                             videoUrl = url,
+                            headers  = inlineHeaders,
                             modifier = Modifier.fillMaxSize()
                         )
-                        // Close inline player button
                         IconButton(
                             onClick = { showInlinePlayer = false },
                             modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(4.dp)
-                                .size(28.dp)
-                                .clip(androidx.compose.foundation.shape.CircleShape)
-                                .background(Color.Black.copy(alpha = 0.6f))
+                                .align(Alignment.TopEnd).padding(4.dp).size(28.dp)
+                                .clip(CircleShape).background(Color.Black.copy(alpha = 0.6f))
                         ) {
-                            Icon(
-                                Icons.Default.Close, "Close preview",
-                                tint = Color.White, modifier = Modifier.size(16.dp)
-                            )
+                            Icon(Icons.Default.Close, "Close", tint = Color.White,
+                                modifier = Modifier.size(16.dp))
                         }
-                        // Expand to fullscreen button
                         IconButton(
                             onClick = onWatch,
                             modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .padding(4.dp)
-                                .size(28.dp)
-                                .clip(androidx.compose.foundation.shape.CircleShape)
-                                .background(Color.Black.copy(alpha = 0.6f))
+                                .align(Alignment.TopStart).padding(4.dp).size(28.dp)
+                                .clip(CircleShape).background(Color.Black.copy(alpha = 0.6f))
                         ) {
-                            Icon(
-                                Icons.Default.Fullscreen, "Fullscreen",
-                                tint = CyberCyan, modifier = Modifier.size(16.dp)
-                            )
+                            Icon(Icons.Default.Fullscreen, "Fullscreen", tint = CyberCyan,
+                                modifier = Modifier.size(16.dp))
                         }
                     }
                 }
@@ -959,9 +982,9 @@ fun ShieldedResultCard(
             ) {
                 ActionBtn("▶", "Watch",    NeonGreen,    onWatch)
                 ActionBtn("⬇", "Download", NeonGreenDim, onDownload)
-                ActionBtn("↑", "Browser",  TextSecondary, onBrowser)
+                // Browser opens in-app WebView — user stays on results screen
+                ActionBtn("↑", "Browser",  TextSecondary) { showInAppBrowser = true }
                 ActionBtn("👁", "In App",  CyberPurple,  onInApp)
-                // Favourite
                 IconButton(onClick = onLike, modifier = Modifier.size(36.dp)) {
                     Icon(
                         if (isLiked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
@@ -972,6 +995,27 @@ fun ShieldedResultCard(
                 }
             }
         }
+    }
+
+    // Thumbnail preview dialog (tap on thumbnail)
+    if (showThumbnailPreview) {
+        ThumbnailPreviewDialog(
+            thumbnailUrl = result.thumbnailUrl,
+            title        = result.title,
+            duration     = result.duration,
+            onDismiss    = { showThumbnailPreview = false },
+            onWatch      = { showThumbnailPreview = false; onWatch() },
+            onBrowser    = { showThumbnailPreview = false; showInAppBrowser = true }
+        )
+    }
+
+    // In-app browser dialog — stays on results screen
+    if (showInAppBrowser) {
+        InAppBrowserDialog(
+            url      = result.url,
+            title    = result.title,
+            onDismiss = { showInAppBrowser = false }
+        )
     }
 }
 
@@ -994,46 +1038,80 @@ private fun ActionBtn(
 }
 
 /**
- * Lightweight embedded ExoPlayer view used for the inline thumbnail preview.
- * No custom controls — just the raw video surface with a buffering indicator.
- * The user can expand to fullscreen via the Watch button.
+ * Lightweight embedded ExoPlayer for inline card preview.
+ * Supports HLS, DASH, progressive, and smooth-streaming with custom headers.
+ * Auto-retries with alternate format on playback error.
  */
 @Composable
 private fun InlineExoPlayerView(
     videoUrl: String,
+    headers: Map<String, String> = emptyMap(),
     modifier: Modifier = Modifier
 ) {
     val context     = androidx.compose.ui.platform.LocalContext.current
     var isBuffering by remember { mutableStateOf(true) }
+    var retryCount  by remember { mutableStateOf(0) }
+    var formatIndex by remember { mutableStateOf(0) }  // 0=auto-detect, 1=HLS, 2=DASH, 3=progressive
 
-    val httpFactory = remember(videoUrl) {
+    val httpFactory = remember(videoUrl, headers) {
+        val ua = headers["User-Agent"] ?: com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT
         androidx.media3.datasource.DefaultHttpDataSource.Factory()
-            .setUserAgent(com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT)
+            .setUserAgent(ua)
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
             .setAllowCrossProtocolRedirects(true)
+            .apply { if (headers.isNotEmpty()) setDefaultRequestProperties(headers) }
     }
 
-    val exoPlayer = remember(videoUrl) {
-        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
-            val uri    = android.net.Uri.parse(videoUrl)
-            val lower  = videoUrl.lowercase()
-            val source = when {
-                lower.contains(".m3u8") || lower.contains("/hls/") ->
-                    androidx.media3.exoplayer.hls.HlsMediaSource.Factory(httpFactory)
-                        .setAllowChunklessPreparation(true)
-                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
-                lower.contains(".mpd") || lower.contains("/dash/") ->
-                    androidx.media3.exoplayer.dash.DashMediaSource.Factory(httpFactory)
-                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
-                else ->
-                    androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(httpFactory)
-                        .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+    val exoPlayer = remember(videoUrl, retryCount, formatIndex) {
+        val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+            .setBufferDurationsMs(1_500, 30_000, 500, 1_500)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .setTargetBufferBytes(4 * 1024 * 1024)
+            .build()
+
+        androidx.media3.exoplayer.ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .build().apply {
+                val uri   = android.net.Uri.parse(videoUrl)
+                val lower = videoUrl.lowercase()
+                val source = when {
+                    // Explicit format override after error
+                    formatIndex == 1 ->
+                        androidx.media3.exoplayer.hls.HlsMediaSource.Factory(httpFactory)
+                            .setAllowChunklessPreparation(true)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    formatIndex == 2 ->
+                        androidx.media3.exoplayer.dash.DashMediaSource.Factory(httpFactory)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    formatIndex == 3 ->
+                        androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(httpFactory)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    // Auto-detect from URL
+                    lower.contains(".m3u8") || lower.contains("/hls/") ||
+                    lower.contains("master.m3u8") || lower.contains("index.m3u8") ->
+                        androidx.media3.exoplayer.hls.HlsMediaSource.Factory(httpFactory)
+                            .setAllowChunklessPreparation(true)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    lower.contains(".mpd") || lower.contains("/dash/") ||
+                    lower.contains("manifest.mpd") ->
+                        androidx.media3.exoplayer.dash.DashMediaSource.Factory(httpFactory)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    lower.contains(".mp4") || lower.contains(".webm") ||
+                    lower.contains(".mkv") || lower.contains(".m4v") ||
+                    lower.contains(".mov") || lower.contains(".avi") ||
+                    lower.contains(".ts") || lower.contains(".flv") ->
+                        androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(httpFactory)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                    else ->
+                        // Unknown — try progressive first, listener will retry HLS/DASH on error
+                        androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(httpFactory)
+                            .createMediaSource(androidx.media3.common.MediaItem.fromUri(uri))
+                }
+                setMediaSource(source)
+                prepare()
+                playWhenReady = true
             }
-            setMediaSource(source)
-            prepare()
-            playWhenReady = true
-        }
     }
 
     DisposableEffect(exoPlayer) {
@@ -1041,12 +1119,13 @@ private fun InlineExoPlayerView(
             override fun onPlaybackStateChanged(state: Int) {
                 isBuffering = state == androidx.media3.common.Player.STATE_BUFFERING
             }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                // Cycle through formats on error: progressive → HLS → DASH → give up
+                if (formatIndex < 3) { formatIndex++; retryCount++ }
+            }
         }
         exoPlayer.addListener(listener)
-        onDispose {
-            exoPlayer.removeListener(listener)
-            exoPlayer.release()
-        }
+        onDispose { exoPlayer.removeListener(listener); exoPlayer.release() }
     }
 
     Box(modifier = modifier.background(Color.Black)) {
@@ -1065,8 +1144,8 @@ private fun InlineExoPlayerView(
         )
         if (isBuffering) {
             CircularProgressIndicator(
-                color    = CyberCyan,
-                modifier = Modifier.size(32.dp).align(Alignment.Center),
+                color       = CyberCyan,
+                modifier    = Modifier.size(32.dp).align(Alignment.Center),
                 strokeWidth = 2.dp
             )
         }

@@ -48,6 +48,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.smoothstreaming.SsMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 import com.aggregatorx.app.engine.util.EngineUtils
@@ -113,16 +114,38 @@ private fun AggregatorXPlayerTheme(content: @Composable () -> Unit) {
     )
 }
 
-private enum class MediaType { HLS, DASH, PROGRESSIVE, UNKNOWN }
+private enum class MediaType { HLS, DASH, PROGRESSIVE, SMOOTH_STREAMING, UNKNOWN }
 
 private fun detectMediaType(url: String): MediaType {
-
     val lower = url.lowercase()
     return when {
-        lower.contains(".m3u8") || lower.contains("/hls/") -> MediaType.HLS
-        lower.contains(".mpd") || lower.contains("/dash/") -> MediaType.DASH
+        lower.contains(".m3u8") || lower.contains("/hls/") ||
+        lower.contains("master.m3u8") || lower.contains("index.m3u8") ||
+        lower.contains("playlist.m3u8") || lower.contains("chunklist") ||
+        lower.contains("type=m3u8") || lower.contains("format=m3u8") -> MediaType.HLS
+
+        lower.contains(".mpd") || lower.contains("/dash/") ||
+        lower.contains("manifest.mpd") || lower.contains("type=mpd") -> MediaType.DASH
+
+        (lower.contains("/manifest") && (lower.contains("ism") || lower.contains("smooth"))) ||
+        lower.endsWith("/manifest") || lower.contains(".ism/manifest") -> MediaType.SMOOTH_STREAMING
+
         lower.contains(".mp4") || lower.contains(".webm") || lower.contains(".mkv") ||
-        lower.contains(".m4v") || lower.contains(".mov") -> MediaType.PROGRESSIVE
+        lower.contains(".m4v") || lower.contains(".mov") || lower.contains(".avi") ||
+        lower.contains(".ts")  || lower.contains(".flv") || lower.contains(".wmv") ||
+        lower.contains(".3gp") || lower.contains(".f4v") || lower.contains(".ogv") ||
+        lower.contains(".mp3") || lower.contains(".aac") || lower.contains(".ogg") ||
+        lower.contains(".flac")|| lower.contains(".wav") || lower.contains(".m4a") -> MediaType.PROGRESSIVE
+
+        lower.contains("videoplayback") || lower.contains("/get_video") ||
+        lower.contains("/dl/") || lower.contains("googlevideo.com") ||
+        lower.contains("akamaized.net") || lower.contains("cloudfront.net") ||
+        lower.contains("cdn.streamtape") || lower.contains("dood.") ||
+        lower.contains("filemoon.") || lower.contains("streamwish.") ||
+        lower.contains("mixdrop.") || lower.contains("voe.sx") ||
+        lower.contains("upstream.to") || lower.contains("streamlare.") ||
+        lower.contains("vidplay.") || lower.contains("mp4upload.") -> MediaType.PROGRESSIVE
+
         else -> MediaType.UNKNOWN
     }
 }
@@ -195,6 +218,8 @@ private fun FullScreenPlayer(
                         .createMediaSource(MediaItem.fromUri(uri))
                     MediaType.DASH -> DashMediaSource.Factory(httpFactory)
                         .createMediaSource(MediaItem.fromUri(uri))
+                    MediaType.SMOOTH_STREAMING -> SsMediaSource.Factory(httpFactory)
+                        .createMediaSource(MediaItem.fromUri(uri))
                     else -> ProgressiveMediaSource.Factory(httpFactory)
                         .createMediaSource(MediaItem.fromUri(uri))
                 }
@@ -240,15 +265,31 @@ private fun FullScreenPlayer(
             }
             override fun onIsPlayingChanged(playing: Boolean) { isPlaying = playing }
             override fun onPlayerError(error: PlaybackException) {
-                hasError = true
-                errorMessage = when (error.errorCode) {
-                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> "Network error"
-                    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND -> "Stream not found (404)"
-                    PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> "Unsupported format"
-                    else -> "Playback error (${error.errorCode})"
-                }
-                if (formatOverride == null && activeType != MediaType.PROGRESSIVE) {
-                    formatOverride = MediaType.PROGRESSIVE; hasError = false; retryCount++
+                // Cycle through formats before showing error
+                val formatOrder = listOf(
+                    MediaType.PROGRESSIVE, MediaType.HLS,
+                    MediaType.DASH, MediaType.SMOOTH_STREAMING
+                )
+                val tried = formatOverride ?: activeType
+                val next  = formatOrder.firstOrNull { it != tried && it != activeType }
+                if (next != null && retryCount < 3) {
+                    formatOverride = next
+                    hasError = false
+                    retryCount++
+                } else {
+                    hasError = true
+                    errorMessage = when (error.errorCode) {
+                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED  -> "Network connection failed"
+                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> "Connection timed out"
+                        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS            -> "Stream unavailable (HTTP error)"
+                        PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND             -> "Stream not found (404)"
+                        PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED    -> "Malformed stream manifest"
+                        PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> "Unsupported video format"
+                        PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED   -> "Corrupted video data"
+                        PlaybackException.ERROR_CODE_DECODING_FAILED               -> "Decoding failed"
+                        PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW            -> "Behind live window"
+                        else -> "Playback error (${error.errorCode})"
+                    }
                 }
             }
         }
