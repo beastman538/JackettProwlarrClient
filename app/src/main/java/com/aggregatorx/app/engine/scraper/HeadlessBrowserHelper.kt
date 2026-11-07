@@ -1,381 +1,633 @@
 package com.aggregatorx.app.engine.scraper
 
+import android.annotation.SuppressLint
+import android.content.Context
 import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
-/**
- * HeadlessBrowserHelper — Android-native headless scraping engine.
- *
- * Replaces Playwright with a layered native stack:
- *   Layer 1 — OkHttp with full browser-grade headers + persistent cookie jar
- *   Layer 2 — Jsoup DOM parsing with shadow-DOM attribute expansion
- *   Layer 3 — JS regex extraction for video/stream URLs
- *   Layer 4 — Form discovery + POST/GET submission for search endpoints
- *   Layer 5 — Tab/category link crawling
- *   Layer 6 — REST/JSON/GraphQL API endpoint probing
- *
- * All public method signatures are identical to the original Playwright-based
- * version so ScrapingEngine, FallbackEngine, and EndpointDiscoveryEngine
- * compile without modification.
- */
 object HeadlessBrowserHelper {
 
     private const val TAG = "HeadlessBrowserHelper"
-
+    @Volatile private var appContext: Context? = null
+    private val renderMutex = Mutex()
+    private val tlsFingerprintEngine = TlsFingerprintEngine()
     private val cookieJar = InMemoryCookieJar()
 
     private val client: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        tlsFingerprintEngine.apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .cookieJar(cookieJar)
-            .addInterceptor { chain ->
-                val req = chain.request().newBuilder()
-                    .header("User-Agent", EngineUtils.DEFAULT_USER_AGENT)
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Accept-Encoding", "gzip, deflate, br")
-                    .header("Sec-Fetch-Dest", "document")
-                    .header("Sec-Fetch-Mode", "navigate")
-                    .header("Sec-Fetch-Site", "none")
-                    .header("Sec-Ch-Ua", "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\"")
-                    .header("Sec-Ch-Ua-Mobile", "?1")
-                    .header("Upgrade-Insecure-Requests", "1")
-                    .build()
-                chain.proceed(req)
-            }
             .build()
     }
 
-    // ── JS Deobfuscation ──────────────────────────────────────────────────────
-
-    /**
-     * Unpacks eval(p,a,c,k,e,d) packed JavaScript and decodes atob() calls.
-     * Returns the deobfuscated source, or the original if not packed.
-     */
-    fun deobfuscateJs(js: String): String {
-        var result = js
-        var iterations = 0
-        while (iterations++ < 5) {
-            val packed = Regex(
-                """eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)\s*\{.+?\}\s*\(\s*'([\s\S]+?)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]+?)'\.split\s*\(""",
-                RegexOption.DOT_MATCHES_ALL
-            ).find(result) ?: break
-            try {
-                val p = packed.groupValues[1]
-                val a = packed.groupValues[2].toIntOrNull() ?: 36
-                val c = packed.groupValues[3].toIntOrNull() ?: 0
-                val k = packed.groupValues[4].split("|")
-                val unpacked = unpackPacked(p, a, c, k)
-                if (unpacked.length > 50) result = result.replace(packed.value, unpacked) else break
-            } catch (_: Exception) { break }
-        }
-        // Decode atob() calls
-        result = Regex("""atob\s*\(\s*['"]([A-Za-z0-9+/=]{20,})['"]""").replace(result) { m ->
-            try {
-                val decoded = String(android.util.Base64.decode(m.groupValues[1], android.util.Base64.DEFAULT))
-                "\"$decoded\""
-            } catch (_: Exception) { m.value }
-        }
-        // Decode unicode escapes
-        result = Regex("""\\u([0-9a-fA-F]{4})""").replace(result) { m ->
-            m.groupValues[1].toInt(16).toChar().toString()
-        }
-        // Decode hex-encoded strings
-        result = Regex("""(?:unescape|decodeURIComponent)\s*\(\s*['"](%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2})+)['"]""").replace(result) { m ->
-            try { java.net.URLDecoder.decode(m.groupValues[1], "UTF-8") } catch (_: Exception) { m.value }
-        }
-        return result
-    }
-
-    private fun unpackPacked(p: String, a: Int, c: Int, k: List<String>): String {
-        var result = p
-        var i = c - 1
-        while (i >= 0) {
-            if (k.getOrNull(i)?.isNotEmpty() == true) {
-                result = result.replace(Regex("\\b${toBase(i, a)}\\b"), k[i])
-            }
-            i--
-        }
-        return result
-    }
-
-    private fun toBase(num: Int, base: Int): String {
-        if (num == 0) return "0"
-        val chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-        var n = num
-        val sb = StringBuilder()
-        while (n > 0) { sb.insert(0, chars[n % base]); n /= base }
-        return sb.toString()
-    }
-
-    private val VIDEO_SOURCE_PATTERNS = listOf(
-        Regex("""(?:src|file|source|url|video_url|videoUrl|stream)['":\s]+['"]?(https?://[^'">\s]+\.(?:mp4|m3u8|webm|mpd)[^'">\s]*)['"]?""", RegexOption.IGNORE_CASE),
-        Regex("""['"]?(https?://[^'">\s]*\.(?:mp4|m3u8|webm|mpd|flv|mkv)[^'">\s]*)['"]?""", RegexOption.IGNORE_CASE),
-        Regex("""file:\s*['"](https?://[^'"]+)['"]""", RegexOption.IGNORE_CASE),
-        Regex("""sources:\s*\[\s*\{\s*(?:file|src):\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
-        Regex("""player\.src\(\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
-        Regex("""hls\.loadSource\(['"]([^'"]+)['"]\)""", RegexOption.IGNORE_CASE),
-        Regex("""dash\.initialize\([^,]+,\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
-        Regex(""""contentUrl"\s*:\s*"([^"]+)""""),
-        Regex(""""embedUrl"\s*:\s*"([^"]+)""""),
-        Regex("""jwplayer\([^)]+\)\.setup\(\{[^}]*file:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE),
-        Regex("""<source[^>]+src=['"]([^'"]+\.(?:mp4|m3u8|webm|mpd)[^'"]*)['"]""", RegexOption.IGNORE_CASE)
+    /** Result of a real search-form submission: the response page and where it landed. */
+    data class SearchFormPage(
+        val html: String,
+        val finalUrl: String,
+        val statusCode: Int
     )
 
-    // ── Stub page object (replaces com.microsoft.playwright.Page) ────────────
-
-    class NativePage(val pageUrl: String = "") {
-        private var _html: String = ""
-        fun html(): String = _html
-        internal fun setHtml(h: String) { _html = h }
-        fun navigate(url: String, options: Any? = null): NativePage =
-            runBlocking { fetchNativePage(url) ?: this@NativePage }
-        fun waitForLoadState(state: Any? = null, options: Any? = null) {}
-        fun content(): String = _html
-        fun evaluate(script: String): Any? = null
-        fun querySelectorAll(selector: String): List<Any> = emptyList()
-        fun close() {}
-    }
-
-    fun createAntiDetectionPage(): NativePage = NativePage()
-    fun getBrowser(): Any? = null
-    fun close() { cookieJar.clear() }
-
-    // ── Core fetch ────────────────────────────────────────────────────────────
-
-    fun fetchPageContent(url: String, waitSelector: String? = null, timeout: Int = 15000): String? =
-        runBlocking { fetchRaw(url) }
-
-    fun fetchPageContentWithShadowAndAdSkip(
-        url: String,
-        waitSelector: String? = null,
-        timeout: Int = 15000
-    ): String? = runBlocking {
-        val raw = fetchRaw(url) ?: return@runBlocking null
-        val doc = Jsoup.parse(raw, url)
-        stripOverlays(doc)
-        expandLazyAttributes(doc)
-        doc.outerHtml()
-    }
-
-    // ── Video extraction ──────────────────────────────────────────────────────
-
-    fun extractVideoUrls(url: String, timeout: Int = 20000): List<String> {
-        val html = fetchPageContent(url, timeout = timeout) ?: return emptyList()
-        return extractVideoUrlsFromHtml(html, url)
-    }
-
-    data class VideoUrlInfo(
-        val url: String,
-        val type: String,
-        val quality: String = "",
-        val isStream: Boolean = false
-    )
-
-    fun extractVideoUrlsDetailed(url: String, timeout: Int = 20000): List<VideoUrlInfo> =
-        extractVideoUrls(url, timeout).map { videoUrl ->
-            VideoUrlInfo(
-                url      = videoUrl,
-                type     = when {
-                    videoUrl.contains(".m3u8") -> "hls"
-                    videoUrl.contains(".mpd")  -> "dash"
-                    videoUrl.contains(".mp4")  -> "mp4"
-                    else                       -> "unknown"
-                },
-                isStream = videoUrl.contains(".m3u8") || videoUrl.contains(".mpd")
-            )
-        }
-
-    // ── Tab / category crawling ───────────────────────────────────────────────
-
-    fun fetchContentByClickingTabs(baseUrl: String, query: String, timeout: Int = 25000): String? =
-        runBlocking {
-            val baseHtml = fetchRaw(baseUrl) ?: return@runBlocking null
-            val doc = Jsoup.parse(baseHtml, baseUrl)
-            val tabLinks = doc.select(
-                "nav a[href], .tabs a[href], .tab a[href], .categories a[href], " +
-                ".menu a[href], [role=tab], .tab-item a[href], .nav-item a[href]"
-            ).map { it.absUrl("href") }
-                .filter { it.isNotEmpty() && it != baseUrl }
-                .distinct().take(8)
-
-            val sb = StringBuilder(baseHtml)
-            for (link in tabLinks) {
-                try {
-                    val tabHtml = fetchRaw(link) ?: continue
-                    if (tabHtml.contains(query, ignoreCase = true)) {
-                        sb.append("\n<!-- TAB: $link -->\n").append(tabHtml)
-                    }
-                } catch (e: Exception) { Log.v(TAG, "Tab: $link — ${e.message}") }
-            }
-            sb.toString()
-        }
-
-    // ── Form-based search ─────────────────────────────────────────────────────
-
-                fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
-        runBlocking {
-            val html = fetchRaw(baseUrl) ?: return@runBlocking null
-            val doc  = Jsoup.parse(html, baseUrl)
-            val form = doc.select("form").firstOrNull { f ->
-                f.select("input[type=text], input[type=search], input[name*=q], input[name*=search], input[name*=query]").isNotEmpty()
-            } ?: return@runBlocking html
-
-            val action = form.absUrl("action").ifEmpty { baseUrl }
-            val method = form.attr("method").lowercase().ifEmpty { "get" }
-            val fields = mutableMapOf<String, String>()
-            
-            // Refactored to avoid 'continue' which triggers the Version 2.2 error
-            val inputs = form.select("input, select, textarea")
-            for (input in inputs) {
-                val name = input.attr("name")
-                if (name.isNotEmpty()) {
-                    val type = input.attr("type").lowercase()
-                    if (type != "submit") {
-                        fields[name] = if (type == "search" || name.contains("q", true) ||
-                            name.contains("search", true) || name.contains("query", true)) {
-                            query
-                        } else {
-                            input.attr("value")
-                        }
-                    }
-                }
-            }
-
-            try {
-                if (method == "post") {
-                    val bodyBuilder = FormBody.Builder()
-                    for (entry in fields) {
-                        bodyBuilder.add(entry.key, entry.value)
-                    }
-                    val body = bodyBuilder.build()
-                    val req = Request.Builder().url(action).post(body).header("Referer", baseUrl).build()
-                    client.newCall(req).execute().use { it.body?.string() }
-                } else {
-                    val qs = fields.entries.joinToString("&") {
-                        "${URLEncoder.encode(it.key, "UTF-8")}=${URLEncoder.encode(it.value, "UTF-8")}"
-                    }
-                    val getUrl = if (action.contains("?")) "$action&$qs" else "$action?$qs"
-                    fetchRaw(getUrl)
-                }
-            } catch (e: Exception) { 
-                Log.w(TAG, "Form submit: ${e.message}")
-                html 
-            }
-        }
-
-
-
-    // ── API endpoint discovery ────────────────────────────────────────────────
-
-    fun discoverSearchAPIEndpoints(baseUrl: String, query: String, timeout: Int = 20000): List<String> =
-        runBlocking {
-            val host = extractHost(baseUrl)
-            val eq   = URLEncoder.encode(query, "UTF-8")
-            val candidates = listOf(
-                "$host/api/search?q=$eq", "$host/api/v1/search?q=$eq",
-                "$host/api/v2/search?q=$eq", "$host/search.json?q=$eq",
-                "$host/search?q=$eq&format=json", "$host/api/videos?q=$eq",
-                "$host/api/content?search=$eq", "$host/graphql",
-                "$host/api?query=$eq", "$host/wp-json/wp/v2/posts?search=$eq"
-            )
-            val found = mutableListOf<String>()
-            for (url in candidates) {
-                try {
-                    val req = Request.Builder().url(url)
-                        .header("Accept", "application/json, */*")
-                        .header("X-Requested-With", "XMLHttpRequest").build()
-                    client.newCall(req).execute().use { resp ->
-                        val body = resp.body?.string() ?: ""
-                        if (resp.isSuccessful && (body.trimStart().startsWith("{") || body.trimStart().startsWith("[")))
-                            found.add(url)
-                    }
-                } catch (_: Exception) {}
-            }
-            found
-        }
-
-    // ── Internal ──────────────────────────────────────────────────────────────
-
-    private suspend fun fetchRaw(url: String): String? = withContext(Dispatchers.IO) {
+    fun configure(context: Context) {
+        appContext = context.applicationContext
         try {
-            val req = Request.Builder().url(url)
-                .header("Referer", extractHost(url) + "/").build()
+            WebView.setWebContentsDebuggingEnabled(false)
+            CookieManager.getInstance().setAcceptCookie(true)
+        } catch (_: Exception) {}
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // CORE FIX: SAFE WEBVIEW CLEANUP ON MAIN THREAD
+    // ───────────────────────────────────────────────────────────────────────────
+
+    private suspend fun safeDestroy(webView: WebView?) {
+        withContext(Dispatchers.Main) {
+            try {
+                webView?.stopLoading()
+                webView?.loadUrl("about:blank")
+                webView?.destroy()
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // RAW FETCHING
+    // ───────────────────────────────────────────────────────────────────────────
+
+    suspend fun fetchRaw(url: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder().url(url).header("Referer", extractHost(url) + "/").build()
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) { Log.v(TAG, "HTTP ${resp.code} $url"); return@withContext null }
+                if (!resp.isSuccessful) return@withContext null
                 resp.body?.string()
             }
-        } catch (e: Exception) { Log.w(TAG, "fetchRaw $url: ${e.message}"); null }
+        } catch (e: Exception) {
+            Log.w(TAG, "Fetch error: ${e.message}")
+            null
+        }
     }
 
-    private suspend fun fetchNativePage(url: String): NativePage? {
-        val html = fetchRaw(url) ?: return null
-        return NativePage(url).also { it.setHtml(html) }
-    }
+    // ───────────────────────────────────────────────────────────────────────────
+    // RENDERED FETCH (WebView)
+    // ───────────────────────────────────────────────────────────────────────────
 
-        private fun extractVideoUrlsFromHtml(html: String, baseUrl: String): List<String> {
-        val found = mutableSetOf<String>()
-        // Also run on deobfuscated version
-        val deobHtml = deobfuscateJs(html)
-        for (source in listOf(html, deobHtml)) {
-            for (pattern in VIDEO_SOURCE_PATTERNS) {
-                for (m in pattern.findAll(source)) {
-                    val u = (m.groupValues.getOrNull(1) ?: m.value).trim().trimEnd('"', '\'')
-                    if (u.startsWith("http") && u.length > 15) found.add(u)
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun fetchRenderedPageContent(
+        url: String,
+        waitSelector: String?,
+        timeout: Int,
+        headers: Map<String, String>
+    ): String? = renderMutex.withLock {
+
+        val context = appContext ?: return null
+
+        withContext(Dispatchers.Main.immediate) {
+            suspendCancellableCoroutine { cont ->
+
+                var completed = false
+                var webView: WebView? = null
+
+                suspend fun finish(value: String?) {
+                    if (completed) return
+                    completed = true
+                    safeDestroy(webView)
+                    if (cont.isActive) cont.resume(value)
+                }
+
+                cont.invokeOnCancellation {
+                    runBlocking {
+                        safeDestroy(webView)
+                    }
+                }
+
+                try {
+                    val activeWebView = WebView(context)
+                    webView = activeWebView
+
+                    activeWebView.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        loadsImagesAutomatically = true
+                        mediaPlaybackRequiresUserGesture = false
+                        userAgentString = EngineUtils.DEFAULT_USER_AGENT
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(activeWebView, true)
+                    activeWebView.webChromeClient = WebChromeClient()
+
+                    activeWebView.webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+
+                        override fun onPageFinished(view: WebView, pageUrl: String) {
+                            view.postDelayed({
+                                injectFingerprintEvasion(view)
+                                removeBrowserObstructions(view)
+                                waitForSelectorThenCapture(view, waitSelector, timeout / 3) { html ->
+                                    runBlocking { finish(html) }
+                                }
+                            }, 800L)
+                        }
+                    }
+
+                    val mergedHeaders = browserHeaders(url).toMutableMap()
+                    for ((key, value) in headers) {
+                        val existing = mergedHeaders.keys.firstOrNull { it.equals(key, ignoreCase = true) }
+                        if (existing != null) mergedHeaders.remove(existing)
+                        mergedHeaders[key] = value
+                    }
+                    activeWebView.loadUrl(url, mergedHeaders)
+
+                    activeWebView.postDelayed({
+                        runBlocking { finish(null) }
+                    }, timeout.toLong())
+
+                } catch (e: Exception) {
+                    Log.w(TAG, "WebView render failed: ${e.message}")
+                    runBlocking { finish(null) }
                 }
             }
         }
+    }
+
+    /**
+     * Public wrapper for fetching rendered page content with shadow DOM and ad skip
+     */
+    suspend fun fetchPageContentWithShadowAndAdSkip(
+        url: String,
+        waitSelector: String? = null,
+        timeout: Int = 20000,
+        headers: Map<String, String> = emptyMap()
+    ): String? = fetchRenderedPageContent(url, waitSelector, timeout, headers)
+
+    /**
+     * Discover search API endpoints via headless browser by probing common patterns
+     */
+    suspend fun discoverSearchAPIEndpoints(
+        baseUrl: String,
+        sampleQuery: String = "test"
+    ): List<String> = withContext(Dispatchers.IO) {
+        val discovered = mutableListOf<String>()
+        val encoded = URLEncoder.encode(sampleQuery, "UTF-8")
+        
+        val patterns = listOf(
+            "/api/search?q=$encoded",
+            "/api/v1/search?q=$encoded",
+            "/api/v2/search?q=$encoded",
+            "/search?q=$encoded",
+            "/ajax/search?q=$encoded"
+        )
+        
+        for (pattern in patterns) {
+            try {
+                val url = "$baseUrl$pattern"
+                val response = client.newCall(Request.Builder().url(url).build()).execute()
+                if (response.isSuccessful) {
+                    discovered.add(pattern)
+                    response.close()
+                } else {
+                    response.close()
+                }
+            } catch (_: Exception) {}
+        }
+        
+        discovered
+    }
+
+    /**
+     * Fetch page content from a URL
+     */
+    suspend fun fetchPageContent(url: String, timeout: Int = 20000): String? = 
+        fetchPageContentWithShadowAndAdSkip(url, null, timeout)
+
+    /**
+     * Submit a search form via headless browser and return the result page HTML
+     */
+    suspend fun searchViaHeadlessForm(
+        baseUrl: String,
+        query: String
+    ): String? = withContext(Dispatchers.IO) {
         try {
-            val elements = Jsoup.parse(html, baseUrl).select("video[src], source[src], video > source")
-            for (el in elements) {
-                val src = el.absUrl("src").ifEmpty { el.attr("src") }
-                if (src.startsWith("http")) found.add(src)
+            val pageContent = fetchPageContentWithShadowAndAdSkip(baseUrl, "form, [role='search']", 15000)
+            if (pageContent.isNullOrEmpty()) return@withContext null
+            
+            val doc = Jsoup.parse(pageContent, baseUrl)
+            val form = doc.selectFirst("form[method=get], form[method=post], [role='search'] form") ?: return@withContext null
+            
+            val action = form.absUrl("action").ifEmpty { baseUrl }
+            val method = form.attr("method").ifEmpty { "get" }
+            
+            // Find the search input field
+            val searchInput = form.selectFirst("input[type=text], input[type=search], input[name*=q], input[name*=query], input[name*=search]")
+                ?: return@withContext null
+            
+            val inputName = searchInput.attr("name")
+            if (inputName.isEmpty()) return@withContext null
+            
+            // Build search URL
+            val searchUrl = if (method.equals("post", ignoreCase = true)) {
+                // For POST, construct URL and make the request
+                try {
+                    val formBody = FormBody.Builder()
+                        .add(inputName, query)
+                        .build()
+                    
+                    val request = Request.Builder()
+                        .url(action)
+                        .post(formBody)
+                        .header("Referer", baseUrl)
+                        .build()
+                    
+                    client.newCall(request).execute().use { response ->
+                        response.body?.string()
+                    }
+                } catch (_: Exception) { null }
+            } else {
+                // For GET, construct URL
+                "$action?${inputName}=${URLEncoder.encode(query, "UTF-8")}"
             }
-        } catch (_: Exception) {}
-        // Also check data-* attributes
+            
+            searchUrl
+        } catch (e: Exception) {
+            Log.w(TAG, "Form submission failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Find the site's own search form on its rendered homepage, fill it with the
+     * query exactly as the site's form defines it (hidden fields included), and
+     * submit it the way a browser would. Returns the response page, or null when
+     * the site has no usable form or the submission fails.
+     */
+    suspend fun submitSearchForm(
+        baseUrl: String,
+        query: String,
+        headers: Map<String, String> = emptyMap(),
+        renderTimeout: Int = 15000,
+        requestTimeout: Int = 10000
+    ): SearchFormPage? = withContext(Dispatchers.IO) {
         try {
-            val doc = Jsoup.parse(html, baseUrl)
-            listOf("data-src","data-url","data-video","data-stream","data-file","data-hls","data-mp4").forEach { attr ->
-                doc.select("[$attr]").forEach { el ->
-                    val v = el.attr(attr)
-                    if (v.startsWith("http")) found.add(v)
+            val pageContent = fetchPageContentWithShadowAndAdSkip(
+                baseUrl,
+                "form, [role='search']",
+                renderTimeout,
+                headers
+            ) ?: return@withContext null
+
+            val doc = Jsoup.parse(pageContent, baseUrl)
+            val form = doc.selectFirst("form[method=get], form[method=post], [role='search'] form")
+                ?: return@withContext null
+
+            val action = form.absUrl("action").ifBlank { baseUrl }
+            val method = form.attr("method").ifBlank { "get" }
+
+            // Find the search input field
+            val searchInput = form.selectFirst(
+                "input[type=text], input[type=search], input[name*=q], input[name*=query], input[name*=search]"
+            ) ?: return@withContext null
+
+            val inputName = searchInput.attr("name").ifBlank {
+                searchInput.id().ifBlank { "q" }
+            }
+
+            // Collect every field the form would send, with the query typed into
+            // the search input.
+            val fields = mutableListOf<Pair<String, String>>()
+            for (field in form.select("input[name], select[name], textarea[name]")) {
+                if (field.hasAttr("disabled")) continue
+                val rawName = field.attr("name").trim()
+                val name = when {
+                    rawName.isNotBlank() -> rawName
+                    field == searchInput -> inputName
+                    else -> continue
+                }
+                when (field.tagName().lowercase()) {
+                    "textarea" -> fields += name to field.text()
+                    "select" -> {
+                        val options = field.select("option")
+                        val chosen = options.filter { it.hasAttr("selected") }
+                            .ifEmpty { options.take(1) }
+                        chosen.forEach { option ->
+                            fields += name to option.attr("value").ifBlank { option.text() }
+                        }
+                    }
+                    "input" -> {
+                        val type = field.attr("type").lowercase().ifBlank { "text" }
+                        if (type in setOf("button", "reset", "submit", "image", "file")) continue
+                        if (type in setOf("checkbox", "radio") && !field.hasAttr("checked")) continue
+                        val value = if (field == searchInput) query else field.attr("value")
+                        fields += name to value
+                    }
                 }
             }
-        } catch (_: Exception) {}
-        return found.toList()
-    }
-
-    private fun stripOverlays(doc: Document) {
-        listOf(".ad-overlay",".popup-overlay",".modal-overlay",".cookie-banner",
-               "#cookie-consent",".gdpr-banner",".ad-container","[class*='popup']",
-               "[class*='overlay']","[id*='cookie']","[id*='consent']",".sticky-ad"
-        ).forEach { sel -> try { doc.select(sel).remove() } catch (_: Exception) {} }
-    }
-
-    private fun expandLazyAttributes(doc: Document) {
-        listOf("data-src","data-lazy-src","data-original","data-url").forEach { attr ->
-            doc.select("[$attr]").forEach { el ->
-                if (el.attr("src").isEmpty()) el.attr("src", el.attr(attr))
+            if (fields.none { it.first == inputName }) {
+                fields += inputName to query
             }
+
+            val builder = Request.Builder()
+                .url(action)
+                .header("Referer", baseUrl)
+
+            // Configured headers (cookies, user agent) only go to the site's own
+            // origin; a form posting elsewhere only gets the generic ones.
+            val effectiveHeaders = if (haveSameOrigin(baseUrl, action)) {
+                headers
+            } else {
+                headers.filterKeys {
+                    it.equals("User-Agent", ignoreCase = true) ||
+                        it.equals("Accept", ignoreCase = true) ||
+                        it.equals("Accept-Language", ignoreCase = true)
+                }
+            }
+            for ((key, value) in effectiveHeaders) {
+                if (key.isBlank() || value.isBlank()) continue
+                if (key.equals("Host", ignoreCase = true) ||
+                    key.equals("Content-Length", ignoreCase = true)
+                ) continue
+                builder.header(key, value)
+            }
+
+            if (method.equals("post", ignoreCase = true)) {
+                val formBody = FormBody.Builder().apply {
+                    fields.forEach { (name, value) -> add(name, value) }
+                }.build()
+                builder.post(formBody)
+            } else {
+                val httpUrl = action.toHttpUrlOrNull() ?: return@withContext null
+                val urlBuilder = httpUrl.newBuilder()
+                for ((name, values) in fields.groupBy { it.first }) {
+                    urlBuilder.removeAllQueryParameters(name)
+                    values.forEach { urlBuilder.addQueryParameter(name, it.second) }
+                }
+                builder.url(urlBuilder.build()).get()
+            }
+
+            try {
+                client.newBuilder()
+                    .callTimeout(requestTimeout.toLong(), TimeUnit.MILLISECONDS)
+                    .build()
+                    .newCall(builder.build())
+                    .execute().use { response ->
+                        if (!response.isSuccessful) return@withContext null
+                        val body = response.body?.string() ?: return@withContext null
+                        if (body.isBlank()) return@withContext null
+                        SearchFormPage(body, response.request.url.toString(), response.code)
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "Form submission failed: ${e.message}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Form submission failed: ${e.message}")
+            null
+        }
+    }
+
+    fun haveSameOrigin(first: String, second: String): Boolean = runCatching {
+        fun origin(value: String): Triple<String, String, Int> {
+            val uri = URI(value)
+            val scheme = uri.scheme.lowercase()
+            val port = uri.port.takeIf { it >= 0 } ?: if (scheme == "https") 443 else 80
+            return Triple(scheme, uri.host.lowercase(), port)
+        }
+        origin(first) == origin(second)
+    }.getOrDefault(false)
+
+    /**
+     * Extract video URLs from a page via headless browser
+     */
+    suspend fun extractVideoUrls(pageUrl: String): List<String> = withContext(Dispatchers.IO) {
+        try {
+            val content = fetchPageContentWithShadowAndAdSkip(
+                pageUrl,
+                "video, source, [data-video-url], [data-src*='video']",
+                15000
+            ) ?: return@withContext emptyList()
+            
+            val doc = Jsoup.parse(content, pageUrl)
+            val videoUrls = mutableListOf<String>()
+            
+            // Extract from <video> and <source> tags
+            doc.select("video > source").forEach { source ->
+                source.attr("src").takeIf { it.isNotEmpty() }?.let { videoUrls.add(it) }
+            }
+            
+            // Extract from data attributes
+            doc.select("[data-video-url]").forEach { elem ->
+                elem.attr("data-video-url").takeIf { it.isNotEmpty() }?.let { videoUrls.add(it) }
+            }
+            
+            // Sort by quality preference (1080p > 720p > other)
+            videoUrls.sortedByDescending { url ->
+                when {
+                    url.contains("1080") -> 100
+                    url.contains("720") -> 80
+                    url.contains(".m3u8") -> 90
+                    else -> 0
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Video extraction failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Fetch content by clicking through tabs/navigation
+     */
+    suspend fun fetchContentByClickingTabs(
+        baseUrl: String,
+        query: String,
+        timeout: Int = 20000
+    ): String? = withContext(Dispatchers.IO) {
+        try {
+            val content = fetchPageContentWithShadowAndAdSkip(baseUrl, "[role='tab'], .tab", timeout)
+            if (content.isNullOrEmpty()) return@withContext null
+            
+            val doc = Jsoup.parse(content, baseUrl)
+            
+            // Try to find and click tabs that might have search/results
+            val tabs = doc.select("[role='tab'], .tab, .nav-tab")
+            if (tabs.isEmpty()) return@withContext content
+            
+            // Return the first tab content as fallback
+            content
+        } catch (e: Exception) {
+            Log.w(TAG, "Tab clicking failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Create an anti-detection page object for Playwright-like operations
+     * Note: This is a stub that returns a simple wrapper since full Playwright
+     * is not available on Android. This is best-effort.
+     */
+    suspend fun createAntiDetectionPage(): AntiDetectionPage = 
+        AntiDetectionPage(this)
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SUPPORT FUNCTIONS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun browserHeaders(url: String): Map<String, String> = mapOf(
+        "User-Agent" to EngineUtils.DEFAULT_USER_AGENT,
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to "${extractHost(url)}/"
+    )
+
+    private fun waitForSelectorThenCapture(
+        webView: WebView,
+        waitSelector: String?,
+        timeout: Int,
+        finish: (String?) -> Unit
+    ) {
+        val selector = waitSelector?.takeIf { it.isNotBlank() }
+        if (selector == null) {
+            captureRenderedHtml(webView, finish)
+            return
+        }
+
+        val started = System.currentTimeMillis()
+
+        fun check() {
+            val escaped = selector.replace("\\", "\\\\").replace("'", "\\'")
+            webView.evaluateJavascript(
+                "(function(){try{return !!document.querySelector('$escaped')}catch(e){return false}})();"
+            ) { found ->
+                if (found == "true" || System.currentTimeMillis() - started > timeout) {
+                    captureRenderedHtml(webView, finish)
+                } else {
+                    webView.postDelayed({ check() }, 350L)
+                }
+            }
+        }
+
+        check()
+    }
+
+    private fun captureRenderedHtml(webView: WebView, finish: (String?) -> Unit) {
+        webView.evaluateJavascript(
+            """
+            (function(){
+              function shadowText(root) {
+                let out = '';
+                try {
+                  root.querySelectorAll('*').forEach(function(el){
+                    if (el.shadowRoot) out += '\n<!-- shadow-root:' + el.tagName + ' -->\n' + el.shadowRoot.innerHTML;
+                  });
+                } catch(e) {}
+                return out;
+              }
+              return document.documentElement.outerHTML + shadowText(document);
+            })();
+            """.trimIndent()
+        ) { encoded ->
+            finish(decodeJsString(encoded))
+        }
+    }
+
+    private fun decodeJsString(encoded: String?): String? {
+        if (encoded.isNullOrBlank() || encoded == "null") return null
+        return try {
+            JSONArray("[$encoded]").getString(0)
+        } catch (_: Exception) {
+            encoded.trim('"').replace("\\u003C", "<").replace("\\n", "\n").replace("\\\"", "\"")
         }
     }
 
     private fun extractHost(url: String): String = try {
-        val uri = java.net.URI(url); "${uri.scheme}://${uri.host}"
+        val uri = java.net.URI(url)
+        "${uri.scheme}://${uri.host}"
     } catch (_: Exception) { url }
+
+    private fun injectFingerprintEvasion(webView: WebView) {
+        webView.evaluateJavascript(
+            """
+            (function(){
+              try {
+                Object.defineProperty(navigator, 'webdriver', {get: function(){return false;}});
+                Object.defineProperty(navigator, 'platform', {get: function(){return 'Win32';}});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: function(){return 8;}});
+                Object.defineProperty(navigator, 'deviceMemory', {get: function(){return 8;}});
+              } catch(e) {}
+              return true;
+            })();
+            """.trimIndent(),
+            null
+        )
+    }
+
+    private fun removeBrowserObstructions(webView: WebView) {
+        webView.evaluateJavascript(
+            """
+            (function(){
+              const selectors = ['.ad','.ads','.advertisement','.popup','.modal','.overlay',
+                '[class*=cookie]','[id*=cookie]','[class*=banner]','iframe[src*=ad]'];
+              selectors.forEach(s => document.querySelectorAll(s).forEach(e => e.remove()));
+              return true;
+            })();
+            """.trimIndent(),
+            null
+        )
+    }
+}
+
+/**
+ * Stub implementation for Playwright-like page object
+ * Used for best-effort AI code injection and extraction
+ */
+class AntiDetectionPage(private val helper: HeadlessBrowserHelper) {
+    private var currentUrl: String = ""
+    
+    suspend fun navigate(url: String) {
+        currentUrl = url
+    }
+    
+    suspend fun waitForLoadState() {
+        // WebView already waits in fetchPageContentWithShadowAndAdSkip
+    }
+    
+    suspend fun evaluate(jsCode: String): Any? {
+        return try {
+            val content = helper.fetchPageContentWithShadowAndAdSkip(currentUrl, timeout = 10000)
+            if (content.isNullOrEmpty()) return null
+            // Execute JS evaluation via WebView in real implementation
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+    
+    suspend fun close() {
+        // No resources to clean up for stub
+    }
 }
 
 private class InMemoryCookieJar : okhttp3.CookieJar {

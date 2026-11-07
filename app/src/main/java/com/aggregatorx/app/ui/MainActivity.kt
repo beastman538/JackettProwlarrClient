@@ -76,57 +76,58 @@ fun MainScreen() {
 
     val screens = listOf(Screen.Search, Screen.Providers, Screen.Settings)
 
-    Scaffold(
-        containerColor = DarkBackground,
-        topBar = {
-            MissionControlTopBar(
-                isPaused = isDiscoveryPaused,
-                onPanicRefresh = { searchViewModel.panicRefresh() },
-                onTogglePause = { searchViewModel.toggleDiscoveryPause() }
-            )
-        },
-        bottomBar = {
-            FuturisticBottomBar(
-                screens = screens,
-                currentDestination = currentDestination,
-                onNavigate = { screen ->
-                    navController.navigate(screen.route) {
-                        popUpTo(navController.graph.findStartDestination().id) {
-                            saveState = true
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = DarkBackground,
+            topBar = {
+                MissionControlTopBar(
+                    isPaused = isDiscoveryPaused,
+                    onPanicRefresh = { searchViewModel.panicRefresh() },
+                    onTogglePause = { searchViewModel.toggleDiscoveryPause() }
+                )
+            },
+            bottomBar = {
+                FuturisticBottomBar(
+                    screens = screens,
+                    currentDestination = currentDestination,
+                    onNavigate = { screen ->
+                        navController.navigate(screen.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
                         }
-                        launchSingleTop = true
-                        restoreState = true
                     }
+                )
+            }
+        ) { paddingValues ->
+            NavHost(
+                navController = navController,
+                startDestination = Screen.Search.route,
+                modifier = Modifier.padding(paddingValues)
+            ) {
+                composable(
+                    route = Screen.Search.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
+                ) {
+                    SearchScreen(viewModel = searchViewModel)
                 }
-            )
-        }
-    ) { paddingValues ->
-        NavHost(
-            navController = navController,
-            startDestination = Screen.Search.route,
-            modifier = Modifier.padding(paddingValues)
-        ) {
-            composable(
-                route = Screen.Search.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
-            ) {
-                // FIXED: Wrapped correctly in lambda context
-                SearchScreen(viewModel = searchViewModel)
-            }
-            composable(
-                route = Screen.Providers.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
-            ) {
-                ProvidersScreen()
-            }
-            composable(
-                route = Screen.Settings.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
-            ) {
-                SettingsScreen()
+                composable(
+                    route = Screen.Providers.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
+                ) {
+                    ProvidersScreen()
+                }
+                composable(
+                    route = Screen.Settings.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
+                ) {
+                    SettingsScreen()
+                }
             }
         }
     }

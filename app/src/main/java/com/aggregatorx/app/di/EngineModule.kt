@@ -14,6 +14,7 @@ import com.aggregatorx.app.engine.media.VideoStreamResolver
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.network.ProxyVPNEngine
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.SmartNavigationEngine
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
@@ -41,8 +42,8 @@ object EngineModule {
     
     @Provides
     @Singleton
-    fun provideCloudflareBypassEngine(): CloudflareBypassEngine {
-        return CloudflareBypassEngine()
+    fun provideCloudflareBypassEngine(tlsFingerprintEngine: TlsFingerprintEngine): CloudflareBypassEngine {
+        return CloudflareBypassEngine(tlsFingerprintEngine)
     }
 
     @Provides
@@ -89,8 +90,13 @@ object EngineModule {
     
     @Provides
     @Singleton
-    fun provideSiteAnalyzerEngine(): SiteAnalyzerEngine {
-        return SiteAnalyzerEngine()
+    fun provideSiteAnalyzerEngine(
+        endpointDiscoveryEngine: EndpointDiscoveryEngine,
+        tokenManager: TokenManager,
+        visionEngine: VisionEngine,
+        tlsFingerprintEngine: TlsFingerprintEngine
+    ): SiteAnalyzerEngine {
+        return SiteAnalyzerEngine(endpointDiscoveryEngine, tokenManager, visionEngine, tlsFingerprintEngine)
     }
     
     @Provides

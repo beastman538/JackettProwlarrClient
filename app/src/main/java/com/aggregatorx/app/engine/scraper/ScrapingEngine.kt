@@ -1,5 +1,6 @@
 package com.aggregatorx.app.engine.scraper
 
+import android.util.Log
 import com.aggregatorx.app.data.database.ProviderDao
 import com.aggregatorx.app.data.database.ScrapingConfigDao
 import com.aggregatorx.app.data.database.SiteAnalysisDao
@@ -8,18 +9,31 @@ import com.aggregatorx.app.engine.analyzer.SmartContentClassifier
 import com.aggregatorx.app.engine.analyzer.PageType
 import com.aggregatorx.app.engine.analyzer.ContainerType
 import com.aggregatorx.app.engine.analyzer.EndpointDiscoveryEngine
+import com.aggregatorx.app.engine.analyzer.UniversalFormatParser
 import com.aggregatorx.app.engine.ai.AIDecisionEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.nlp.ProcessedQuery
+import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
+import com.aggregatorx.app.engine.network.TlsClient
+import com.aggregatorx.app.engine.network.TlsRequest
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import org.jsoup.Connection
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import com.aggregatorx.app.engine.util.EngineUtils
+import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -28,21 +42,13 @@ import kotlin.math.max
 
 /**
  * Advanced Multi-Provider Scraping Engine
- * 
+ *
  * Features:
- * - Concurrent scraping across all enabled providers
- * - Smart navigation to bypass category pages
- * - Intelligent fallback mechanisms
- * - Result scoring and ranking
- * - Rate limiting and retry logic
- * - Pattern-based content extraction
- * - Error resilience with provider isolation
- * - Thumbnail extraction for video previews
- * - INTELLIGENT RESULT VALIDATION - detects category pages vs real results
- * - NEVER BREAKS LOOP - continues to all providers even on failures
- * - AI LEARNING INTEGRATION - learns from every scraping attempt
- * - NLP QUERY UNDERSTANDING - translates natural language descriptions into effective search terms
- * - SEMANTIC RESULT MATCHING - scores results by concept similarity, not just keywords
+ * - Concurrent resilient scraping (one failure never stops the engine)
+ * - NLP-powered query understanding and semantic result matching
+ * - Smart Navigation to bypass category/genre landing pages
+ * - AI Learning integration for adaptive strategy selection
+ * - Multi-layer bypass (Standard -> Cloudflare Bypass -> Headless)
  */
 @Singleton
 class ScrapingEngine @Inject constructor(
@@ -54,42 +60,38 @@ class ScrapingEngine @Inject constructor(
     private val aiDecisionEngine: AIDecisionEngine,
     private val cloudflareBypassEngine: CloudflareBypassEngine,
     private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
+    private val universalFormatParser: UniversalFormatParser,
     private val nlpProcessor: NaturalLanguageQueryProcessor
 ) {
-    // Current NLP-processed query for semantic scoring throughout the pipeline
     @Volatile
     private var currentProcessedQuery: ProcessedQuery? = null
-    fun clearCache() {
-        synchronized(resultCache) {
-            resultCache.clear()
-        }
-    }
-    
-    // Provider health tracking
+
     private val providerHealthMap = ConcurrentHashMap<String, ProviderHealth>()
-    
-    // Rate limiting
     private val lastRequestTime = ConcurrentHashMap<String, Long>()
-    
+
     companion object {
-        private const val DEFAULT_TIMEOUT = 30000
-        private const val DEFAULT_RETRY_COUNT = 3
-        private const val DEFAULT_RETRY_DELAY = 800L
+        private const val DEFAULT_TIMEOUT = 12000
+        private const val DEFAULT_RETRY_COUNT = 1
+        private const val DEFAULT_RETRY_DELAY = 300L
         private const val DEFAULT_RATE_LIMIT_MS = 50L
-        private const val MAX_CONCURRENT_PROVIDERS = 20
-        private val DEFAULT_USER_AGENT = EngineUtils.DEFAULT_USER_AGENT
-        
-        // Delegate to shared user agent pool
-        private val USER_AGENTS = EngineUtils.USER_AGENTS
-        
-        // Patterns to identify category/navigation URLs
+        private const val MAX_CONCURRENT_PROVIDERS = 4
+        private const val CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val TARGET_RESULTS_PER_PROVIDER = 50
+        private const val MAX_PAGES_PER_PROVIDER_SEARCH = 2
+        private const val PER_PROVIDER_TIMEOUT_MS = 25_000L
+        private const val FAST_CANDIDATE_TIMEOUT_MS = 7_000L
+        private const val RENDERED_FALLBACK_TIMEOUT_MS = 9_000L
+        private const val MAX_SEARCH_CANDIDATES = 6
+        private const val CANDIDATE_BATCH_SIZE = 3
+        private const val MIN_RELEVANT_RESULTS_BEFORE_STOP = 5
+        private const val TAG = "AggregatorSearch"
+
         private val CATEGORY_URL_PATTERNS = listOf(
             "/genre/", "/category/", "/browse/", "/filter/", "/tags/",
             "/type/", "/sort/", "/order/", "?genre=", "?category=",
             "?type=", "/all-", "/list/genre", "/movies/genre"
         )
-        
-        // Generic category names to filter out
+
         private val GENERIC_CATEGORY_NAMES = setOf(
             "action", "comedy", "drama", "horror", "thriller", "romance",
             "sci-fi", "documentary", "animation", "anime", "sports", "news",
@@ -98,2159 +100,1198 @@ class ScrapingEngine @Inject constructor(
             "all videos", "trending", "popular", "latest", "new releases",
             "top rated", "most viewed", "recommended"
         )
-        
-        // Patterns that indicate actual content URLs
+
         private val CONTENT_URL_PATTERNS = listOf(
             "/watch", "/video", "/movie/", "/episode/", "/play",
             "/stream", "/view", "/v/", "/e/", "-watch", "-online",
             "-full", "-hd", "-720p", "-1080p", "-episode-"
         )
-
-        // Cache TTL: 10 minutes
-        private const val CACHE_TTL_MS = 10 * 60 * 1000L
     }
 
-    /**
-     * Search across all enabled providers
-     * Returns a Flow that emits results as they come in from each provider
-     *
-     * RESILIENT DESIGN:
-     * - GUARANTEES all enabled providers are scraped (never skips any)
-     * - Never breaks the loop even if individual providers fail
-     * - Sorts providers by success rate (best performers first)
-     * - Emits results progressively as they complete
-     * - Includes comprehensive error handling per-provider
-     * - Auto-retries with fallback strategies including headless browser
-     */
-    // Cache entry wraps results with a timestamp for TTL-based eviction
     private data class CacheEntry(
         val results: List<ProviderSearchResults>,
         val timestamp: Long = System.currentTimeMillis()
     )
 
+    private data class FetchOutcome(
+        val document: Document,
+        val body: String,
+        val finalUrl: String,
+        val statusCode: Int,
+        val transport: String
+    )
+
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+
     private val resultCache = object : LinkedHashMap<String, CacheEntry>(100, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean {
-            return size > 100
-        }
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean = size > 100
     }
 
     var cacheResults: Boolean = true
 
-    fun searchAllProviders(query: String, cache: Boolean = cacheResults): Flow<ProviderSearchResults> = flow {
-        // ── NLP QUERY PROCESSING ────────────────────────────────────
-        // Transform the raw query into optimised search terms using
-        // natural language understanding. This enables descriptive queries
-        // like "scared my cat and it jumped so high" to produce effective
-        // searches like "cat jump scare", "scared cat reaction", etc.
+    fun clearCache() {
+        synchronized(resultCache) { resultCache.clear() }
+    }
+
+    /**
+     * Search across all enabled providers concurrently.
+     * Guaranteed to process every provider; failures are caught and reported individually.
+     */
+    fun searchAllProviders(
+        query: String,
+        pages: Map<String, Int> = emptyMap(),
+        cache: Boolean = cacheResults
+    ): Flow<ProviderSearchResults> = channelFlow {
         val processedQuery = nlpProcessor.processQuery(query)
         currentProcessedQuery = processedQuery
-
-        // Check cache first (respects TTL)
-        if (cache) {
-            val cachedEntry = synchronized(resultCache) {
-                resultCache[query]
+        val cacheKey = buildString {
+            append(query)
+            if (pages.isNotEmpty()) {
+                append('|')
+                append(pages.toSortedMap().entries.joinToString(",") { "${it.key}:${it.value}" })
             }
+        }
+
+        if (cache) {
+            val cachedEntry = synchronized(resultCache) { resultCache[cacheKey] }
             if (cachedEntry != null && System.currentTimeMillis() - cachedEntry.timestamp < CACHE_TTL_MS) {
-                cachedEntry.results.forEach { emit(it) }
-                return@flow
+                cachedEntry.results.forEach { send(it) }
+                return@channelFlow
             }
         }
 
         var enabledProviders = providerDao.getEnabledProvidersSync()
         if (enabledProviders.isEmpty()) {
-            return@flow
+            close()
+            return@channelFlow
         }
 
-        // Sort providers by success rate and avg response time (most successful first)
-        // But GUARANTEE all providers will be searched
         enabledProviders = enabledProviders.sortedWith(
             compareByDescending<Provider> { it.successRate }
                 .thenBy { it.avgResponseTime }
-                .thenByDescending { it.totalSearches }
         )
-        
-        // Track which providers we've processed to ensure none are missed
-        val processedProviders = mutableSetOf<String>()
 
-        // Create a semaphore for rate limiting concurrent requests
         val semaphore = Semaphore(MAX_CONCURRENT_PROVIDERS)
-        val results = mutableListOf<ProviderSearchResults>()
+        val results = java.util.Collections.synchronizedList(mutableListOf<ProviderSearchResults>())
 
-        // Search ALL providers concurrently - NEVER BREAK THE LOOP, NEVER SKIP ANY
-        // Per-provider timeout prevents a single hung provider from blocking the entire search
-        val perProviderTimeoutMs = 90_000L
-
-        coroutineScope {
-            val deferredResults = enabledProviders.map { provider ->
-                async {
+        val jobs = enabledProviders.map { provider ->
+            launch(Dispatchers.IO) {
+                val result = try {
                     semaphore.withPermit {
-                        processedProviders.add(provider.id)
-                        // Wrap in comprehensive try-catch + timeout to ensure no single provider breaks the loop
-                        try {
-                            withTimeoutOrNull(perProviderTimeoutMs) {
-                                safeSearchProvider(provider, query)
-                            } ?: ProviderSearchResults(
-                                provider = provider,
-                                results = emptyList(),
-                                searchTime = perProviderTimeoutMs,
-                                success = false,
-                                errorMessage = "Provider ${provider.name} timed out after ${perProviderTimeoutMs / 1000}s"
-                            )
-                        } catch (e: CancellationException) {
-                            // Coroutine was cancelled (e.g. user navigated away) — still produce a result
-                            // but re-throw so the parent scope knows
-                            throw e
-                        } catch (e: Exception) {
-                            ProviderSearchResults(
-                                provider = provider,
-                                results = emptyList(),
-                                searchTime = 0L,
-                                success = false,
-                                errorMessage = "Provider ${provider.name} error: ${e.message?.take(120)}"
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Emit results as they complete - use individual try-catch for each
-            // This ensures we get results from ALL providers
-            deferredResults.forEachIndexed { index, deferred ->
-                val provider = enabledProviders.getOrNull(index)
-                try {
-                    val result = deferred.await()
-                    results.add(result)
-                    emit(result)
-                } catch (e: CancellationException) {
-                    // Search was cancelled by user — emit what we have and stop cleanly
-                    if (provider != null) {
-                        val cancelledResult = ProviderSearchResults(
+                        withTimeoutOrNull(PER_PROVIDER_TIMEOUT_MS) {
+                            safeSearchProvider(provider, query, pages[provider.id] ?: 0)
+                        } ?: ProviderSearchResults(
                             provider = provider,
                             results = emptyList(),
-                            searchTime = 0L,
+                            searchTime = PER_PROVIDER_TIMEOUT_MS,
                             success = false,
-                            errorMessage = "Search cancelled"
+                            errorMessage = "Timed out"
                         )
-                        results.add(cancelledResult)
-                        emit(cancelledResult)
                     }
+                } catch (e: CancellationException) {
+                    ProviderSearchResults(provider, emptyList(), 0L, false, "Cancelled")
                 } catch (e: Exception) {
-                    // Even if await fails somehow, don't break - create failed result for this provider
-                    // This guarantees the UI knows about every provider
-                    val failedResult = ProviderSearchResults(
-                        provider = provider ?: enabledProviders.firstOrNull() ?: return@forEachIndexed,
-                        results = emptyList(),
-                        searchTime = 0L,
-                        success = false,
-                        errorMessage = "Unexpected error processing ${provider?.name}: ${e.message}"
-                    )
-                    results.add(failedResult)
-                    emit(failedResult)
+                    ProviderSearchResults(provider, emptyList(), 0L, false, "Error: ${e.message?.take(100)}")
                 }
+                results.add(result)
+                send(result)
             }
         }
 
-        // Safety net: check if any enabled provider was missed (should never happen)
-        val missedProviders = enabledProviders.filter { it.id !in processedProviders }
-        for (missed in missedProviders) {
-            val failedResult = ProviderSearchResults(
-                provider = missed,
-                results = emptyList(),
-                searchTime = 0L,
-                success = false,
-                errorMessage = "Provider ${missed.name} was not processed (safety net)"
-            )
-            results.add(failedResult)
-            emit(failedResult)
-        }
-
-        // Cache successful results
+        jobs.joinAll()
         if (cache && results.any { it.success }) {
-            synchronized(resultCache) {
-                resultCache[query] = CacheEntry(results)
-            }
+            synchronized(resultCache) { resultCache[cacheKey] = CacheEntry(results.toList()) }
         }
     }.flowOn(Dispatchers.IO)
 
-    /**
-     * Safe provider search that NEVER throws - always returns a result
-     * ENHANCED WITH INTELLIGENT RESULT VALIDATION:
-     * - Detects category pages vs real content results
-     * - Filters out unusable results (just links to genres/categories)
-     * - Continues to ALL providers even if some fail
-     * - LEARNS FROM EVERY ATTEMPT for AI improvement
-     */
-    private suspend fun safeSearchProvider(provider: Provider, query: String): ProviderSearchResults {
+    private suspend fun safeSearchProvider(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val domain = extractDomain(provider.baseUrl)
-        
-        // Even providers in "cooldown" still get searched via fallback methods
-        // so NO provider is ever silently skipped
-        val inCooldown = provider.failedSearches > 5 && 
-            provider.failedSearches.toFloat() / maxOf(provider.totalSearches, 1).toFloat() > 0.7f
-        
+
         return try {
-            if (inCooldown) {
-                // Skip the primary smart search but STILL try fallback methods
-                // This gives struggling providers a lightweight retry path
-                try {
-                    val fallbackResult = tryFallbackScraping(
-                        provider, query, startTime,
-                        Exception("Provider in cooldown — trying fallback only")
-                    )
-                    if (fallbackResult.success && fallbackResult.results.isNotEmpty()) {
-                        val validatedResults = validateAndFilterResults(fallbackResult.results, query)
-                        if (validatedResults.isNotEmpty()) {
-                            // Provider recovered via fallback — reset cooldown learning
-                            aiDecisionEngine.learnRecovery(domain, "COOLDOWN", "FALLBACK_RECOVERY")
-                            return fallbackResult.copy(results = validatedResults)
-                        }
-                    }
-                    // Cooldown fallback also returned nothing — try NLP queries as last resort
-                    val nlpCooldownResult = retryWithNlpQueries(provider, query, startTime)
-                    nlpCooldownResult ?: fallbackResult
-                } catch (e: Exception) {
-                    ProviderSearchResults(
-                        provider = provider,
-                        results = emptyList(),
-                        searchTime = System.currentTimeMillis() - startTime,
-                        success = false,
-                        errorMessage = "Provider in cooldown, fallback also failed: ${e.message?.take(80)}"
-                    )
-                }
+            val result = searchProviderSmart(provider, query, pageOffset)
+            if (result.results.isEmpty()) {
+                result
             } else {
-                // Get AI recommended strategy
-                val recommendedStrategy = aiDecisionEngine.getAdaptiveStrategy(domain)
-                
-                // Try smart search first
-                val result = searchProviderSmart(provider, query)
-                
-                // Validate the results are actual content, not category pages
-                if (result.success && result.results.isNotEmpty()) {
-                    val validatedResults = validateAndFilterResults(result.results, query)
-                    if (validatedResults.isEmpty() && result.results.isNotEmpty()) {
-                        // Results were all invalid (likely category pages)
-                        // LEARN: category page detection failure
-                        aiDecisionEngine.learnFromFailure(
-                            domain = domain,
-                            errorType = "CATEGORY_PAGE_RESULTS",
-                            errorMessage = "Results were category/navigation pages",
-                            strategy = ScrapingStrategy.HTML_PARSING,
-                            selector = null,
-                            url = provider.baseUrl
-                        )
-                        
-                        // ── NLP RETRY: try NLP-generated queries before giving up ────
-                        val nlpRetryResult = retryWithNlpQueries(provider, query, startTime)
-                        if (nlpRetryResult != null) {
-                            nlpRetryResult
-                        } else {
-                            result.copy(
-                                results = emptyList(),
-                                success = false,
-                                errorMessage = "Results were category/navigation pages, not actual content"
-                            )
-                        }
-                    } else {
-                        // LEARN: successful scraping
-                        aiDecisionEngine.learnFromSuccess(
-                            domain = domain,
-                            strategy = ScrapingStrategy.HTML_PARSING,
-                            resultSelector = null,
-                            titleSelector = null,
-                            thumbnailSelector = null,
-                            resultCount = validatedResults.size,
-                            responseTime = System.currentTimeMillis() - startTime
-                        )
-                        
-                        result.copy(results = validatedResults)
-                    }
+                // Phone-build behavior (sync part 3): the live results pass through
+                // the display filter; if nothing query-matching survives, the
+                // provider reports an honest EMPTY instead of off-query results.
+                val displayResults = SearchResultFilter.filterResultsForDisplay(
+                    result.results,
+                    query,
+                    currentProcessedQuery
+                )
+                if (displayResults.isEmpty()) {
+                    result.copy(
+                        results = emptyList(),
+                        success = false,
+                        errorMessage = "No query-matching media results found",
+                        totalResults = 0,
+                        hasMore = false,
+                        status = ProviderSearchStatus.EMPTY
+                    )
                 } else {
-                    // ── NLP RETRY: primary search returned nothing — try NLP queries ──
-                    val nlpRetryResult = retryWithNlpQueries(provider, query, startTime)
-                    if (nlpRetryResult != null) {
-                        nlpRetryResult
-                    } else {
-                        // LEARN: no results failure
-                        if (!result.success) {
-                            aiDecisionEngine.learnFromFailure(
-                                domain = domain,
-                                errorType = "NO_RESULTS",
-                                errorMessage = result.errorMessage,
-                                strategy = ScrapingStrategy.HTML_PARSING,
-                                selector = null,
-                                url = provider.baseUrl
-                            )
-                        }
-                        result
-                    }
+                    aiDecisionEngine.learnFromSuccess(
+                        domain,
+                        ScrapingStrategy.HYBRID,
+                        null,
+                        null,
+                        null,
+                        displayResults.size,
+                        System.currentTimeMillis() - startTime
+                    )
+                    result.copy(
+                        results = displayResults,
+                        totalResults = displayResults.size,
+                        success = true,
+                        status = ProviderSearchStatus.RESULTS,
+                        hasMore = true
+                    )
                 }
             }
         } catch (e: CancellationException) {
-            // Respect coroutine cancellation — re-throw so parent handles it
             throw e
         } catch (e: Exception) {
-            // LEARN: exception failure
-            try {
-                aiDecisionEngine.learnFromFailure(
-                    domain = domain,
-                    errorType = "EXCEPTION",
-                    errorMessage = e.message,
-                    strategy = ScrapingStrategy.HTML_PARSING,
-                    selector = null,
-                    url = provider.baseUrl
-                )
-            } catch (_: Exception) { /* learning should never break the loop */ }
-            
-            // Primary search failed - try fallback (NEVER BREAK THE LOOP)
-            try {
-                val fallbackResult = tryFallbackScraping(provider, query, startTime, e)
-                
-                // Also validate fallback results
-                if (fallbackResult.success && fallbackResult.results.isNotEmpty()) {
-                    val validatedResults = validateAndFilterResults(fallbackResult.results, query)
-                    if (validatedResults.isEmpty() && fallbackResult.results.isNotEmpty()) {
-                        // Fallback returned category pages — try NLP queries before giving up
-                        val nlpExceptionResult = retryWithNlpQueries(provider, query, startTime)
-                        nlpExceptionResult ?: fallbackResult.copy(
-                            results = emptyList(),
-                            success = false,
-                            errorMessage = "Fallback results were category/navigation pages"
-                        )
-                    } else {
-                        // LEARN: successful fallback recovery
-                        try {
-                            aiDecisionEngine.learnRecovery(domain, "EXCEPTION", "FALLBACK_SUCCESS")
-                            aiDecisionEngine.learnFromSuccess(
-                                domain = domain,
-                                strategy = ScrapingStrategy.HTML_PARSING,
-                                resultSelector = null,
-                                titleSelector = null,
-                                thumbnailSelector = null,
-                                resultCount = validatedResults.size,
-                                responseTime = System.currentTimeMillis() - startTime
-                            )
-                        } catch (_: Exception) { /* learning should never break the loop */ }
-                        
-                        fallbackResult.copy(results = validatedResults)
-                    }
-                } else {
-                    // Fallback search also returned nothing — NLP retry as last resort
-                    val nlpFallbackResult = retryWithNlpQueries(provider, query, startTime)
-                    nlpFallbackResult ?: fallbackResult
-                }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (fallbackEx: Exception) {
-                // All methods failed — final NLP attempt before giving up
-                val nlpLastResort = try {
-                    retryWithNlpQueries(provider, query, startTime)
-                } catch (_: Exception) { null }
-
-                nlpLastResort ?: ProviderSearchResults(
-                    provider = provider,
-                    results = emptyList(),
-                    searchTime = System.currentTimeMillis() - startTime,
-                    success = false,
-                    errorMessage = "All search methods failed: ${e.message?.take(100)}"
-                )
-            }
-        }
-    }
-
-    /**
-     * Retry a provider search using NLP-generated query variants.
-     *
-     * When the user's raw query (e.g. "scared my cat and it jumped so high")
-     * returned zero results, we re-search the same provider with the
-     * semantically rewritten queries produced by [NaturalLanguageQueryProcessor]
-     * (e.g. "cat jump scare", "scared cat reaction", "cat startled jumping").
-     *
-     * Returns a successful [ProviderSearchResults] if any NLP query variant
-     * produced validated results, or null to let the caller fall through to
-     * its existing fallback logic.
-     */
-    private suspend fun retryWithNlpQueries(
-        provider: Provider,
-        originalQuery: String,
-        startTime: Long
-    ): ProviderSearchResults? {
-        val processed = currentProcessedQuery ?: return null
-        if (processed.searchQueries.isEmpty()) return null
-
-        // Only retry with NLP queries that differ from the original
-        val nlpQueries = processed.searchQueries
-            .filter { it.lowercase() != originalQuery.lowercase() }
-            .take(4) // Limit retries to keep latency reasonable
-
-        if (nlpQueries.isEmpty()) return null
-
-        val allResults = mutableListOf<SearchResult>()
-        val seenUrls = mutableSetOf<String>()
-
-        for (nlpQuery in nlpQueries) {
-            try {
-                val result = searchProviderSmart(provider, nlpQuery)
-                if (result.success && result.results.isNotEmpty()) {
-                    val validated = validateAndFilterResults(result.results, originalQuery)
-                    for (r in validated) {
-                        if (r.url !in seenUrls) {
-                            seenUrls.add(r.url)
-                            allResults.add(r.copy(
-                                relevanceScore = calculateRelevanceScore(
-                                    r.title, originalQuery, r.description, r.url
-                                )
-                            ))
-                        }
-                    }
-                    // If we already have a decent batch, stop early
-                    if (allResults.size >= 15) break
-                }
-            } catch (_: CancellationException) {
-                throw CancellationException("Cancelled during NLP retry")
-            } catch (_: Exception) {
-                continue
-            }
-        }
-
-        return if (allResults.isNotEmpty()) {
-            val domain = extractDomain(provider.baseUrl)
-            try {
-                aiDecisionEngine.learnRecovery(domain, "NO_RESULTS", "NLP_QUERY_RETRY")
-                aiDecisionEngine.learnFromSuccess(
-                    domain = domain,
-                    strategy = ScrapingStrategy.HTML_PARSING,
-                    resultSelector = null,
-                    titleSelector = null,
-                    thumbnailSelector = null,
-                    resultCount = allResults.size,
-                    responseTime = System.currentTimeMillis() - startTime
-                )
-            } catch (_: Exception) {}
-
+            aiDecisionEngine.learnFromFailure(domain, "EXCEPTION", e.message, ScrapingStrategy.HTML_PARSING, null, provider.baseUrl)
             ProviderSearchResults(
                 provider = provider,
-                results = allResults.sortedByDescending { it.relevanceScore },
+                results = emptyList(),
                 searchTime = System.currentTimeMillis() - startTime,
-                success = true
+                success = false,
+                errorMessage = e.message ?: e.javaClass.simpleName,
+                status = ProviderSearchStatus.FAILED
             )
-        } else null
-    }
-
-    /** Delegate to shared implementation. */
-    private fun extractDomain(url: String): String =
-        EngineUtils.extractDomain(url)
-    
-    /**
-     * Validate and filter results to ensure they are actual content, not category pages
-     * ENHANCED: Also matches against descriptions and collects related content
-     */
-    private fun validateAndFilterResults(results: List<SearchResult>, query: String): List<SearchResult> {
-        val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
-        val processed = currentProcessedQuery
-
-        return results.filter { result ->
-            val titleLower = result.title.lowercase()
-            val urlLower = result.url.lowercase()
-
-            // Must have a meaningful title
-            if (result.title.trim().length < 3) return@filter false
-
-            // Must have a meaningful URL (not just the base URL itself)
-            val path = try { java.net.URL(result.url).path } catch (_: Exception) { result.url }
-            if (path.length <= 1) return@filter false  // root / or empty
-
-            // Filter out category/navigation links
-            val isCategoryLink = CATEGORY_URL_PATTERNS.any { urlLower.contains(it) }
-            if (isCategoryLink) return@filter false
-
-            // Filter out generic category names only if they have no description AND no thumbnail
-            val isTooGeneric = titleLower.trim() in GENERIC_CATEGORY_NAMES &&
-                              result.description.isNullOrEmpty() &&
-                              result.thumbnailUrl.isNullOrEmpty()
-            if (isTooGeneric) return@filter false
-
-            // Exclude common non-content file types
-            val isExcludedExtension = urlLower.matches(Regex(".*\\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)(\\?.*)?$"))
-            if (isExcludedExtension) return@filter false
-
-            // ── RELEVANCE GATE (NLP-ENHANCED) ───────────────────────────────
-            // Accept results that match EITHER:
-            //  1. At least one raw query keyword, OR
-            //  2. Any concept term from NLP processing (subjects, actions, synonyms)
-            //  3. A semantic relevance score ≥ 15 from the NLP processor
-            if (queryWords.isNotEmpty() || processed != null) {
-                val descLower = result.description?.lowercase() ?: ""
-                val urlPath = try {
-                    java.net.URL(result.url).path.lowercase().replace("-", " ").replace("_", " ")
-                } catch (_: Exception) { urlLower }
-                val combined = "$titleLower $descLower $urlPath"
-
-                // Check 1: raw keyword match (original behaviour)
-                val hasAnyKeyword = queryWords.any { combined.contains(it) }
-                if (hasAnyKeyword) return@filter true
-
-                // Check 2: NLP concept term match
-                if (processed != null) {
-                    val hasConceptMatch = processed.conceptTerms.any { term ->
-                        combined.contains(term)
-                    }
-                    if (hasConceptMatch) return@filter true
-
-                    // Check 3: semantic relevance scoring
-                    val semanticScore = nlpProcessor.calculateSemanticRelevance(
-                        result.title,
-                        result.description,
-                        processed.concepts
-                    )
-                    if (semanticScore >= 15f) return@filter true
-                }
-
-                // None of the checks passed — reject this result
-                return@filter false
-            }
-
-            true
         }
     }
-    
-    /**
-     * Enhanced matching that searches in titles, descriptions, and URLs.
-     * Now also checks NLP concept terms and semantic synonyms.
-     * Returns true if any part of the content matches the query.
-     */
-    private fun matchesQueryEnhanced(result: SearchResult, query: String): Boolean {
-        val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
-        
-        // Check title
-        val titleLower = result.title.lowercase()
-        if (queryWords.any { titleLower.contains(it) }) return true
-        
-        // Check description
-        val descLower = result.description?.lowercase() ?: ""
-        if (descLower.isNotEmpty() && queryWords.any { descLower.contains(it) }) return true
-        
-        // Check URL path (often contains keywords)
-        val urlPath = try {
-            java.net.URL(result.url).path.lowercase()
-        } catch (e: Exception) {
-            result.url.lowercase()
-        }
-        if (queryWords.any { urlPath.contains(it.replace(" ", "-")) || urlPath.contains(it.replace(" ", "_")) }) return true
-        
-        // Fuzzy matching for similar terms
-        val titleWords = titleLower.split(Regex("\\W+")).filter { it.length > 2 }
-        for (queryWord in queryWords) {
-            for (titleWord in titleWords) {
-                if (areSimilarWords(queryWord, titleWord)) return true
-            }
-        }
 
-        // ── NLP concept matching ─────────────────────────────────────────
-        val processed = currentProcessedQuery
-        if (processed != null) {
-            val combined = "$titleLower $descLower $urlPath"
-            // Check NLP concept terms (subjects, actions, descriptors + their synonyms)
-            if (processed.conceptTerms.any { combined.contains(it) }) return true
-            // Semantic relevance threshold
-            val semanticScore = nlpProcessor.calculateSemanticRelevance(
-                result.title, result.description, processed.concepts
-            )
-            if (semanticScore >= 15f) return true
-        }
-        
-        return false
-    }
-    
-    /**
-     * Check if two words are similar using Levenshtein edit distance
-     */
-    private fun areSimilarWords(word1: String, word2: String): Boolean {
-        if (word1 == word2) return true
-        if (word1.length < 3 || word2.length < 3) return false
-        
-        // One contains the other (e.g. "spider" / "spiderman")
-        // Guard: the shorter word must be ≥ 60% the length of the longer to prevent
-        // false positives like "art" matching "started"
-        val shorter = if (word1.length <= word2.length) word1 else word2
-        val longer  = if (word1.length <= word2.length) word2 else word1
-        if (shorter.length >= 4 && shorter.length.toFloat() / longer.length >= 0.6f &&
-            longer.contains(shorter)) return true
-        
-        // Same start (stem matching) — must share first 3 letters AND ≥ 4-char prefix
-        val minLen = minOf(word1.length, word2.length)
-        if (minLen >= 5 && word1.take(3) == word2.take(3) && word1.take(minLen - 1) == word2.take(minLen - 1)) return true
-        
-        // True Levenshtein edit distance — conservative thresholds
-        val maxDist = when {
-            minLen <= 4 -> 0   // short words must match exactly
-            minLen <= 6 -> 1
-            minLen <= 9 -> 2
-            else -> 2          // capped at 2 to avoid false positives
-        }
-        val editDist = levenshteinDistance(word1, word2)
-        return editDist in 1..maxDist
-    }
-    
-    /** Delegate to shared implementation. */
-    private fun levenshteinDistance(a: String, b: String): Int =
-        EngineUtils.levenshteinDistance(a, b)
-    
-    /**
-     * Generate related/similar results even when main query doesn't match exactly
-     * This helps provide content when exact matches are few
-     */
-    private fun findRelatedContent(
-        allResults: List<SearchResult>,
-        query: String,
-        existingMatches: List<SearchResult>
-    ): List<SearchResult> {
-        val existingUrls = existingMatches.map { it.url }.toSet()
-        val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
-        
-        // Find results that partially match — require at least one exact keyword
-        return allResults
-            .filter { it.url !in existingUrls }
-            .filter { result ->
-                // Must contain at least ONE exact query keyword in title or description
-                val combined = "${result.title.lowercase()} ${result.description?.lowercase() ?: ""}"
-                queryWords.any { combined.contains(it) }
-            }
-            .map { result ->
-                val relevance = calculatePartialRelevance(result, queryWords)
-                Pair(result, relevance)
-            }
-            .filter { it.second > 0.4f }
-            .sortedByDescending { it.second }
-            .take(15)
-            .map { it.first.copy(relevanceScore = it.second * 50f) }
-    }
-    
-    /**
-     * Calculate partial relevance for related content matching
-     */
-    private fun calculatePartialRelevance(result: SearchResult, queryWords: List<String>): Float {
-        var score = 0f
-        val titleLower = result.title.lowercase()
-        val descLower = result.description?.lowercase() ?: ""
-        val combined = "$titleLower $descLower"
-        
-        for (word in queryWords) {
-            // Exact word match
-            if (combined.contains(word)) {
-                score += 0.3f
-            }
-            // Partial/fuzzy match
-            else if (combined.split(Regex("\\W+")).any { areSimilarWords(it, word) }) {
-                score += 0.15f
-            }
-        }
-        
-        // Bonus for having thumbnail (likely real content)
-        if (!result.thumbnailUrl.isNullOrEmpty()) score += 0.1f
-        
-        // Bonus for having description
-        if (!result.description.isNullOrEmpty()) score += 0.05f
-        
-        return score.coerceIn(0f, 1f)
-    }
-    
-    /**
-     * Smart search that uses SmartNavigationEngine to bypass category pages
-     */
-    suspend fun searchProviderSmart(provider: Provider, query: String): ProviderSearchResults {
+    suspend fun searchProviderSmart(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
-
-        // ── NLP QUERY SELECTION ─────────────────────────────────────────
-        // When the raw query is conversational natural language, use the
-        // first (best) NLP-generated search query for the actual provider
-        // search. This converts e.g. "scared my cat and it jumped so high"
-        // into "cat jump scare" which matches real content titles.
         val processed = currentProcessedQuery
-        val effectiveQuery = if (processed != null &&
-            processed.isNaturalLanguage &&
-            processed.searchQueries.isNotEmpty() &&
-            query == processed.originalQuery
-        ) {
-            processed.searchQueries.first()
-        } else {
-            query
-        }
-
         return try {
             enforceRateLimit(provider.id)
             providerDao.incrementSearchCount(provider.id)
-
-            // Step 1: Try to find a search URL (works for most providers)
-            val smartSearchUrl = smartNavigationEngine.findSearchUrl(provider.baseUrl, effectiveQuery)
-
-            if (smartSearchUrl != null) {
-                val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl)
-                if (results.isNotEmpty()) {
-                    updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                    return ProviderSearchResults(
-                        provider = provider,
-                        results = results,
-                        searchTime = System.currentTimeMillis() - startTime,
-                        success = true
-                    )
-                }
-            }
-
-            // Step 2: No search found – try crawling tabs/categories as a smart alternative
-            // This handles sites that organise content by genre/category tabs without search
-            val tabResults = scrapeWithTabCrawl(provider, effectiveQuery)
-            if (tabResults.isNotEmpty()) {
-                updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                return ProviderSearchResults(
-                    provider = provider,
-                    results = tabResults,
-                    searchTime = System.currentTimeMillis() - startTime,
-                    success = true
-                )
-            }
-
-            // Step 2.5: Try advanced endpoint discovery (hidden APIs, CMS endpoints)
-            // Uses learned endpoints first, then probes new ones + headless interception
-            try {
-                val domain = extractDomain(provider.baseUrl)
-                // Prefer any previously-learned endpoints for this domain
-                val learnedEndpoints = endpointDiscoveryEngine.getRankedEndpoints(domain)
-                var foundViaEndpoint = false
-
-                for (endpoint in learnedEndpoints.take(3)) {
-                    val url = endpoint
-                        .replace("{query}", java.net.URLEncoder.encode(effectiveQuery, "UTF-8"))
-                        .let { if (it.startsWith("http")) it else "${provider.baseUrl.trimEnd('/')}$it" }
-                    try {
-                        val apiDoc = fetchDocument(url)
-                        val apiResults = extractResultsWithThumbnails(apiDoc, provider, query)
-                        if (apiResults.isNotEmpty()) {
-                            endpointDiscoveryEngine.learnWorkingEndpoint(domain, endpoint, apiResults.size)
-                            aiDecisionEngine.learnEndpoint(domain, endpoint, ScrapingStrategy.API_BASED, apiResults.size)
-                            updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                            return ProviderSearchResults(
-                                provider = provider,
-                                results = apiResults,
-                                searchTime = System.currentTimeMillis() - startTime,
-                                success = true
-                            )
-                        } else {
-                            endpointDiscoveryEngine.learnFailedEndpoint(domain, endpoint)
-                        }
-                    } catch (_: Exception) {
-                        endpointDiscoveryEngine.learnFailedEndpoint(domain, endpoint)
-                    }
-                }
-
-                // If no learned endpoint worked, try standard discovery
-                val apiSearchUrl = endpointDiscoveryEngine.getBestSearchEndpoint(provider.baseUrl, effectiveQuery)
-                if (apiSearchUrl != null) {
-                    val apiDoc = fetchDocument(apiSearchUrl)
-                    val apiResults = extractResultsWithThumbnails(apiDoc, provider, query)
-                    if (apiResults.isNotEmpty()) {
-                        updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                        aiDecisionEngine.learnFromSuccess(
-                            domain = domain,
-                            strategy = ScrapingStrategy.API_BASED,
-                            resultSelector = null,
-                            titleSelector = null,
-                            thumbnailSelector = null,
-                            resultCount = apiResults.size,
-                            responseTime = System.currentTimeMillis() - startTime
-                        )
-                        return ProviderSearchResults(
-                            provider = provider,
-                            results = apiResults,
-                            searchTime = System.currentTimeMillis() - startTime,
-                            success = true
-                        )
-                    }
-                }
-            } catch (_: Exception) {}
-
-            // Step 3: Fall back to normal search with all its own fallbacks
-            searchProvider(provider, effectiveQuery)
-        } catch (e: Exception) {
-            searchProvider(provider, effectiveQuery)
-        }
-    }
-    
-    /**
-     * Scrape using smart navigation with pagination support
-     * Also attempts to collect page 2 and 3 if initial results are thin
-     */
-    private suspend fun scrapeWithSmartNavigation(
-        provider: Provider,
-        query: String,
-        searchUrl: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val document = fetchDocument(searchUrl)
-
-        // If we landed on a category page, navigate past it first
-        val (activeUrl, activeDoc) = if (smartNavigationEngine.isCategoryPage(searchUrl, document)) {
-            val nav = smartNavigationEngine.navigatePastCategory(provider.baseUrl, document, query)
-            nav ?: (searchUrl to document)
-        } else {
-            searchUrl to document
-        }
-
-        val pageOneResults = extractResultsWithThumbnails(activeDoc, provider, query)
-
-        // If results are thin, collect additional pages
-        if (pageOneResults.size < 15) {
-            val paginationUrls = smartNavigationEngine.getPaginationLinks(activeDoc, provider.baseUrl, maxPages = 3)
-            val allResults = pageOneResults.toMutableList()
-            val seenUrls = pageOneResults.map { it.url }.toMutableSet()
-
-            for (pageUrl in paginationUrls) {
-                try {
-                    val pageDoc = fetchDocument(pageUrl)
-                    val pageResults = extractResultsWithThumbnails(pageDoc, provider, query)
-                    pageResults.forEach { r ->
-                        if (r.url !in seenUrls) {
-                            seenUrls.add(r.url)
-                            allResults.add(r)
-                        }
-                    }
-                    if (allResults.size >= 50) break
-                } catch (_: Exception) {}
-            }
-
-            return@withContext allResults.sortedByDescending { it.relevanceScore }
-        }
-
-        pageOneResults
-    }
-    
-    /**
-     * Extract results with thumbnail URLs
-     * v3: Fixes ContentLink destructuring bug (was using title as thumbnailUrl),
-     * uses all ContentLink fields directly, falls back gracefully to full content dump.
-     */
-    private fun extractResultsWithThumbnails(
-        document: Document,
-        provider: Provider,
-        query: String
-    ): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        val allExtracted = mutableListOf<SearchResult>()
-
-        // Use SmartNavigationEngine to extract content links
-        val contentLinks = smartNavigationEngine.extractContentLinks(document, provider.baseUrl)
-
-        for (contentLink in contentLinks) {
-            val url = contentLink.url
-            // Prefer title from ContentLink (correct field), fall back to URL/doc extraction
-            val title = contentLink.title.takeIf { it.length > 2 }
-                ?: extractTitleFromUrl(url)
-                ?: findTitleInDocument(document, url)
-                ?: continue
-
-            val description = findDescriptionInDocument(document, url)
-            val thumbnailUrl = contentLink.thumbnail  // correct field (was taking .title before)
-
-            val combinedRelevance = calculateRelevanceScore(title, query, description, url)
-
-            val result = SearchResult(
-                title = title,
-                url = url,
-                thumbnailUrl = thumbnailUrl,
-                description = description,
-                providerId = provider.id,
-                providerName = provider.name,
-                relevanceScore = combinedRelevance
-            )
-
-            allExtracted.add(result)
-
-            if (matchesQueryEnhanced(result, query)) {
-                results.add(result)
-            }
-        }
-
-        // Also try generic extraction if not enough results
-        if (results.size < 5) {
-            val genericResults = extractResultsGeneric(document, provider, query)
-            results.addAll(genericResults)
-        }
-
-        val uniqueResults = results.distinctBy { it.url }
-        if (uniqueResults.size < 10) {
-            val related = findRelatedContent(allExtracted, query, uniqueResults)
-            val combined = (uniqueResults + related).distinctBy { it.url }
-
-            if (combined.size < 5 && allExtracted.size > combined.size) {
-                val existingUrls = combined.map { it.url }.toSet()
-                // ONLY backfill with results that pass the relevance gate
-                val remaining = validateAndFilterResults(
-                    allExtracted.filter { it.url !in existingUrls }, query
-                ).sortedByDescending { it.relevanceScore }.take(15)
-                return (combined + remaining).distinctBy { it.url }
-            }
-
-            return combined
-        }
-
-        return uniqueResults
-    }
-    
-    /**
-     * Find description for a content URL in document
-     */
-    private fun findDescriptionInDocument(document: Document, url: String): String? {
-        // Try to find the container that has this link
-        val linkElement = document.select("a[href='$url'], a[href*='${url.substringAfterLast("/")}']").firstOrNull()
-            ?: return null
-        
-        // Look for description in parent or sibling elements
-        val parent = linkElement.parent() ?: return null
-        val grandparent = parent.parent()
-        
-        val descSelectors = listOf(
-            ".description", ".desc", ".synopsis", ".summary", ".text",
-            "p", ".info", "[class*='desc']", "[class*='info']"
-        )
-        
-        // Search in parent and grandparent
-        for (container in listOfNotNull(parent, grandparent)) {
-            for (selector in descSelectors) {
-                val desc = container.select(selector).firstOrNull()?.text()?.trim()
-                if (!desc.isNullOrEmpty() && desc.length > 10 && desc.length < 500) {
-                    return desc
-                }
-            }
-        }
-        
-        return null
-    }
-    
-    private fun extractTitleFromUrl(url: String): String? {
-        return try {
-            val path = java.net.URL(url).path
-            val segments = path.split("/").filter { it.isNotBlank() }
-            segments.lastOrNull()
-                ?.replace("-", " ")
-                ?.replace("_", " ")
-                ?.replace(Regex("\\.[a-z]{3,4}$"), "")
-                ?.replaceFirstChar { it.uppercase() }
-        } catch (e: Exception) {
-            null
-        }
-    }
-    
-    private fun findTitleInDocument(document: Document, url: String): String? {
-        return document.select("a[href='$url'], a[href*='${url.substringAfterLast("/")}']")
-            .firstOrNull()?.text()?.takeIf { it.isNotBlank() }
-    }
-    
-
-    
-    /**
-     * Search a single provider with full error handling and fallback
-     */
-    suspend fun searchProvider(provider: Provider, query: String): ProviderSearchResults {
-        val startTime = System.currentTimeMillis()
-        
-        return try {
-            // Rate limiting
-            enforceRateLimit(provider.id)
-            
-            // Update search count
-            providerDao.incrementSearchCount(provider.id)
-            
-            // Get scraping config or use analysis
             val config = scrapingConfigDao.getConfigForProvider(provider.id)
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
-            
-            // Try primary scraping method
-            val results = when {
-                config != null -> scrapeWithConfig(provider, query, config)
-                analysis != null -> scrapeWithAnalysis(provider, query, analysis)
-                else -> scrapeGeneric(provider, query)
+            val merged = LinkedHashMap<String, SearchResult>()
+            val primary = searchBoundedCandidates(provider, query, pageOffset, config, analysis)
+            for (result in primary) {
+                merged[result.url] = result
             }
-            
-            // Update provider health on success
-            updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-            
+            val primaryMatches = merged.values.count {
+                SearchResultFilter.hasQueryAffinity(it, query, processed)
+            }
+            if (primaryMatches < 5 && processed != null && processed.isNaturalLanguage &&
+                query.equals(processed.originalQuery, ignoreCase = true)
+            ) {
+                val refinements = processed.searchQueries
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() && !it.equals(query, ignoreCase = true) }
+                    .distinctBy { it.lowercase() }
+                    .take(2)
+                for (refinement in refinements) {
+                    val refined = searchBoundedCandidates(
+                        provider, refinement, pageOffset, config, analysis,
+                        candidateLimit = 2, useExpensiveFallback = false
+                    )
+                    for (result in refined) {
+                        val existing = merged[result.url]
+                        if (existing == null || result.relevanceScore > existing.relevanceScore) {
+                            merged[result.url] = result
+                        }
+                    }
+                    val matches = merged.values.count {
+                        SearchResultFilter.hasQueryAffinity(it, query, processed)
+                    }
+                    if (matches >= 5) break
+                }
+            }
+            val results = merged.values
+                .sortedByDescending { it.relevanceScore }
+                .take(TARGET_RESULTS_PER_PROVIDER)
+            val elapsed = System.currentTimeMillis() - startTime
+            updateProviderHealth(provider.id, results.isNotEmpty(), elapsed)
+            if (results.isEmpty()) {
+                providerDao.incrementFailedCount(provider.id)
+            }
             ProviderSearchResults(
                 provider = provider,
                 results = results,
-                searchTime = System.currentTimeMillis() - startTime,
-                success = true
+                searchTime = elapsed,
+                success = results.isNotEmpty(),
+                errorMessage = if (results.isEmpty()) "No query-matching media results found" else null,
+                totalResults = results.size,
+                hasMore = results.isNotEmpty(),
+                status = if (results.isNotEmpty()) ProviderSearchStatus.RESULTS else ProviderSearchStatus.EMPTY
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            // Try fallback methods
-            tryFallbackScraping(provider, query, startTime, e)
+            val elapsed = System.currentTimeMillis() - startTime
+            Log.w(TAG, "provider=${provider.name} failed after ${elapsed}ms: ${e.message}")
+            updateProviderHealth(provider.id, false, elapsed)
+            ProviderSearchResults(
+                provider = provider,
+                results = emptyList(),
+                searchTime = elapsed,
+                success = false,
+                errorMessage = e.message ?: e.javaClass.simpleName,
+                totalResults = 0,
+                hasMore = false,
+                status = ProviderSearchStatus.FAILED
+            )
         }
     }
-    
-    /**
-     * Scrape using stored configuration
-     */
-    private suspend fun scrapeWithConfig(
-        provider: Provider, 
-        query: String, 
-        config: ScrapingConfig
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val encodedQuery = URLEncoder.encode(query, config.encoding)
-        val searchUrl = config.searchUrlTemplate
-            .replace("{baseUrl}", provider.baseUrl)
-            .replace("{query}", encodedQuery)
-            .replace("{page}", "1")
-        
-        val document = fetchDocument(searchUrl, config)
-        extractResultsWithConfig(document, provider, query, config)
-    }
-    
-    /**
-     * Scrape using site analysis data
-     */
-    private suspend fun scrapeWithAnalysis(
-        provider: Provider, 
-        query: String, 
-        analysis: SiteAnalysis
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        // Build search URL from analysis
-        val searchUrl = buildSearchUrl(provider, query, analysis)
-        
-        val document = fetchDocument(searchUrl)
-        extractResultsWithAnalysis(document, provider, query, analysis)
-    }
-    
-    /**
-     * Generic scraping for sites without configuration.
-     * Uses the full expanded URL-pattern list (mirrors SmartNavigationEngine patterns)
-     * so that even the initial generic scrape has high coverage.
-     */
-    private suspend fun scrapeGeneric(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val enc = URLEncoder.encode(query, "UTF-8")
-        val slug = query.trim().lowercase().replace(Regex("\\s+"), "-")
-        val plus = query.trim().replace(Regex("\\s+"), "+")
-        val base = provider.baseUrl.trimEnd('/')
 
-        val searchPatterns = listOf(
-            "$base/search?q=$enc",
-            "$base/?s=$enc",
-            "$base/search?query=$enc",
-            "$base/?q=$enc",
-            "$base/search?s=$enc",
-            "$base/search?keyword=$enc",
-            "$base/search?keywords=$enc",
-            "$base/search?term=$enc",
-            "$base/search?text=$enc",
-            "$base/?search_query=$enc",
-            "$base/results?q=$enc",
-            "$base/videos?search=$enc",
-            "$base/movies?search=$enc",
-            "$base/search.php?q=$enc",
-            "$base/search.html?q=$enc",
-            "$base/find?q=$enc",
-            "$base/index.php?s=$enc",
-            "$base/index.php?q=$enc",
-            "$base/?search=$enc",
-            "$base/search/$enc",
-            "$base/search/$slug",
-            "$base/api/search?q=$enc"
-        )
-
-        for (pattern in searchPatterns) {
-            try {
-                val document = fetchDocument(pattern)
-                val results = extractResultsGeneric(document, provider, query)
-                if (results.isNotEmpty()) {
-                    return@withContext results
-                }
-            } catch (e: Exception) {
-                continue
-            }
-        }
-
-        emptyList()
-    }
-    
     /**
-     * Fallback scraping when primary method fails
-     * ENHANCED: Uses headless browser more aggressively and tries multiple strategies
+     * Bounded candidate search: try the provider's candidate search URLs in small
+     * parallel batches and merge everything they return by URL (keeping the
+     * highest-scored copy of each result). When too few results match the query
+     * and [useExpensiveFallback] is on, fall back to the expensive paths: submit
+     * the site's own search form when one is known to exist, otherwise render the
+     * first candidate in the WebView.
      */
-    private suspend fun tryFallbackScraping(
+    private suspend fun searchBoundedCandidates(
         provider: Provider,
         query: String,
-        startTime: Long,
-        originalException: Exception
-    ): ProviderSearchResults {
-        // Mark initial failure
-        providerDao.incrementFailedCount(provider.id)
+        pageOffset: Int,
+        config: ScrapingConfig?,
+        analysis: SiteAnalysis?,
+        candidateLimit: Int = MAX_SEARCH_CANDIDATES,
+        useExpensiveFallback: Boolean = true
+    ): List<SearchResult> {
+        val candidates = buildSearchCandidates(provider, query, pageOffset, config, analysis)
+            .take(candidateLimit.coerceAtLeast(1))
+        val merged = LinkedHashMap<String, SearchResult>()
 
-        // Try alternative methods in order of resource usage
-        // Tab-crawl is included for sites that have no search functionality
-        val fallbackMethods: List<suspend () -> List<SearchResult>> = listOf(
-            { scrapeGeneric(provider, query) },
-            { scrapeWithAlternateUserAgent(provider, query) },
-            { searchWithDecomposedQuery(provider, query) },
-            { scrapeWithDelay(provider, query) },
-            { scrapeMobileVersion(provider, query) },
-            { scrapeWithAlternateSearchPatterns(provider, query) },
-            { scrapeWithTabCrawl(provider, query) },       // NEW: crawls tabs/categories
-            { scrapeProviderHomepage(provider, query) }
-        )
-
-        for (method in fallbackMethods) {
-            try {
-                val results = method()
-                if (results.isNotEmpty()) {
-                    updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                    return ProviderSearchResults(
-                        provider = provider,
-                        results = results,
-                        searchTime = System.currentTimeMillis() - startTime,
-                        success = true
-                    )
+        fun mergeKeepingBest(results: List<SearchResult>) {
+            for (result in results) {
+                val existing = merged[result.url]
+                if (existing == null || result.relevanceScore > existing.relevanceScore) {
+                    merged[result.url] = result
                 }
-            } catch (e: Exception) {
-                continue
             }
         }
 
-        // Headless browser fallback (Playwright) - tries multiple strategies
-        try {
-            // Strategy A: Try common search URL patterns via headless
-            val searchUrls = buildSearchUrlsForHeadless(provider, query)
-            for (searchUrl in searchUrls) {
-                try {
-                    val html = HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
-                        searchUrl,
-                        waitSelector = ".item, .result, .video-item, article, .card",
-                        timeout = 20000
-                    )
-                    if (!html.isNullOrEmpty()) {
-                        val doc = org.jsoup.Jsoup.parse(html, provider.baseUrl)
-                        val results = extractResultsWithThumbnails(doc, provider, query)
-                        if (results.isNotEmpty()) {
-                            updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                            return ProviderSearchResults(provider = provider, results = results,
-                                searchTime = System.currentTimeMillis() - startTime, success = true)
+        for (batch in candidates.chunked(CANDIDATE_BATCH_SIZE)) {
+            val outcomes = supervisorScope {
+                batch.map { candidate ->
+                    async(Dispatchers.IO) {
+                        withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
+                            fetchFastOutcome(candidate, config, query, pageOffset, provider.baseUrl)
                         }
                     }
-                } catch (_: Exception) { continue }
+                }.awaitAll().filterNotNull()
             }
 
-            // Strategy B: Headless search form submission (JS-rendered search)
-            try {
-                val formHtml = HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, query, timeout = 25000)
-                if (!formHtml.isNullOrEmpty()) {
-                    val doc = org.jsoup.Jsoup.parse(formHtml, provider.baseUrl)
-                    val results = extractResultsWithThumbnails(doc, provider, query)
-                    if (results.isNotEmpty()) {
-                        updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                        return ProviderSearchResults(provider = provider, results = results,
-                            searchTime = System.currentTimeMillis() - startTime, success = true)
-                    }
-                }
-            } catch (_: Exception) {}
-
-            // Strategy C: Headless tab/category clicking for no-search sites
-            try {
-                val tabHtml = HeadlessBrowserHelper.fetchContentByClickingTabs(provider.baseUrl, query, timeout = 25000)
-                if (!tabHtml.isNullOrEmpty()) {
-                    val doc = org.jsoup.Jsoup.parse(tabHtml, provider.baseUrl)
-                    val results = extractResultsWithThumbnails(doc, provider, query)
-                    if (results.isNotEmpty()) {
-                        updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                        return ProviderSearchResults(provider = provider, results = results,
-                            searchTime = System.currentTimeMillis() - startTime, success = true)
-                    }
-                }
-            } catch (_: Exception) {}
-
-            // Strategy D: Headless base URL scrape
-            try {
-                val html = HeadlessBrowserHelper.fetchPageContent(provider.url)
-                if (!html.isNullOrEmpty()) {
-                    val doc = org.jsoup.Jsoup.parse(html, provider.url)
-                    val results = extractResultsWithThumbnails(doc, provider, query)
-                    if (results.isNotEmpty()) {
-                        updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                        return ProviderSearchResults(provider = provider, results = results,
-                            searchTime = System.currentTimeMillis() - startTime, success = true)
-                    }
-                }
-            } catch (_: Exception) {}
-        } catch (_: Exception) {}
-
-        // All fallbacks failed
-        updateProviderHealth(provider.id, false, System.currentTimeMillis() - startTime)
-        return ProviderSearchResults(
-            provider = provider,
-            results = emptyList(),
-            searchTime = System.currentTimeMillis() - startTime,
-            success = false,
-            errorMessage = "All scraping methods failed (including headless): ${originalException.message}"
-        )
-    }
-    
-    /**
-     * Build multiple search URLs to try with headless browser
-     */
-    private fun buildSearchUrlsForHeadless(provider: Provider, query: String): List<String> {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val baseUrl = provider.baseUrl.trimEnd('/')
-        
-        return listOf(
-            "$baseUrl/search?q=$encodedQuery",
-            "$baseUrl/search?query=$encodedQuery",
-            "$baseUrl/search/$encodedQuery",
-            "$baseUrl/?s=$encodedQuery",
-            "$baseUrl/videos?search=$encodedQuery",
-            "$baseUrl/movies?search=$encodedQuery",
-            "$baseUrl/search.php?q=$encodedQuery",
-            "$baseUrl/find?q=$encodedQuery",
-            "$baseUrl/?q=$encodedQuery",
-            "$baseUrl/results?search_query=$encodedQuery"
-        )
-    }
-    
-    /**
-     * Try alternate search URL patterns not covered by scrapeGeneric.
-     * Uses extractResultsWithThumbnails instead of extractResultsGeneric for
-     * richer result extraction (thumbnails, descriptions, SmartNavigation).
-     */
-    private suspend fun scrapeWithAlternateSearchPatterns(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val slug = query.trim().lowercase().replace(Regex("\\s+"), "-")
-        val baseUrl = provider.baseUrl.trimEnd('/')
-
-        // Only patterns NOT already in scrapeGeneric
-        val extraPatterns = listOf(
-            "$baseUrl/search/$slug",
-            "$baseUrl/videos?q=$encodedQuery",
-            "$baseUrl/movies?q=$encodedQuery",
-            "$baseUrl/results?search_query=$encodedQuery",
-            "$baseUrl/search/${query.replace(" ", "+")}"
-        )
-
-        for (pattern in extraPatterns) {
-            try {
-                val document = fetchDocument(pattern)
-                val results = extractResultsWithThumbnails(document, provider, query)
-                if (results.isNotEmpty()) {
-                    return@withContext results
-                }
-            } catch (e: Exception) {
-                continue
+            for (outcome in outcomes) {
+                val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+                Log.i(
+                    TAG,
+                    "provider=${provider.name} transport=${outcome.transport} status=${outcome.statusCode} " +
+                        "bytes=${outcome.body.length} parsed=${extracted.size} url=${outcome.finalUrl.take(180)}"
+                )
+                mergeKeepingBest(extracted)
             }
         }
 
-        emptyList()
+        var queryMatches = merged.values.count {
+            SearchResultFilter.hasQueryAffinity(it, query, currentProcessedQuery)
+        }
+
+        if (useExpensiveFallback && queryMatches < MIN_RELEVANT_RESULTS_BEFORE_STOP) {
+            val hasSearchForm = when {
+                analysis?.searchFormSelector != null -> true
+                analysis?.rawHtml != null -> Regex("<form\\b", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(analysis.rawHtml!!)
+                else -> false
+            }
+            if (hasSearchForm) {
+                val formPage = withTimeoutOrNull(10_000L) {
+                    HeadlessBrowserHelper.submitSearchForm(
+                        provider.baseUrl,
+                        query,
+                        buildRequestHeaders(config, provider.baseUrl, provider.baseUrl, isPost = false),
+                        5000,
+                        5000
+                    )
+                }
+                if (formPage != null) {
+                    val outcome = FetchOutcome(
+                        document = Jsoup.parse(formPage.html, formPage.finalUrl),
+                        body = formPage.html,
+                        finalUrl = formPage.finalUrl,
+                        statusCode = formPage.statusCode,
+                        transport = "webview-form"
+                    )
+                    val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+                    Log.i(
+                        TAG,
+                        "provider=${provider.name} transport=webview-form status=${formPage.statusCode} " +
+                            "bytes=${formPage.html.length} parsed=${extracted.size} url=${formPage.finalUrl.take(180)}"
+                    )
+                    mergeKeepingBest(extracted)
+                } else {
+                    Log.i(TAG, "provider=${provider.name} transport=webview-form no usable form response")
+                }
+            } else {
+                val renderUrl = candidates.firstOrNull() ?: provider.url
+                val renderedHtml = withTimeoutOrNull(RENDERED_FALLBACK_TIMEOUT_MS) {
+                    HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                        url = renderUrl,
+                        waitSelector = analysis?.resultContainerSelector ?: "body",
+                        timeout = RENDERED_FALLBACK_TIMEOUT_MS.toInt()
+                    )
+                }
+                if (!renderedHtml.isNullOrBlank()) {
+                    val outcome = FetchOutcome(
+                        document = Jsoup.parse(renderedHtml, renderUrl),
+                        body = renderedHtml,
+                        finalUrl = renderUrl,
+                        statusCode = 200,
+                        transport = "webview"
+                    )
+                    val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+                    Log.i(TAG, "provider=${provider.name} transport=webview bytes=${renderedHtml.length} parsed=${extracted.size}")
+                    for (result in extracted) {
+                        merged.putIfAbsent(result.url, result)
+                    }
+                }
+            }
+        }
+
+        queryMatches = merged.values.count {
+            SearchResultFilter.hasQueryAffinity(it, query, currentProcessedQuery)
+        }
+        Log.i(
+            TAG,
+            "provider=${provider.name} searchSummary candidates=${candidates.size} " +
+                "unique=${merged.size} queryMatches=$queryMatches"
+        )
+        return merged.values
+            .sortedByDescending { it.relevanceScore }
+            .take(TARGET_RESULTS_PER_PROVIDER)
     }
 
-    /**
-     * Scrape a provider by crawling its tabs/categories when search is unavailable.
-     * Intelligently scores each tab against the query and visits the most relevant ones.
-     * Falls back to visiting all generic content tabs if nothing matches.
-     */
-    private suspend fun scrapeWithTabCrawl(
+    private fun buildSearchCandidates(
         provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val contentLinks = smartNavigationEngine.crawlCategoryTabsForQuery(
-            baseUrl = provider.baseUrl,
-            query = query,
-            maxTabs = 8
-        )
-        if (contentLinks.isEmpty()) return@withContext emptyList()
+        query: String,
+        pageOffset: Int,
+        config: ScrapingConfig?,
+        analysis: SiteAnalysis?
+    ): List<String> {
+        val encoding = config?.encoding?.takeIf { it.isNotBlank() } ?: "UTF-8"
+        val encoded = runCatching { URLEncoder.encode(query, encoding) }
+            .getOrElse { URLEncoder.encode(query, "UTF-8") }
+        val page = pageOffset + 1
+        val base = provider.baseUrl.trimEnd('/')
+        val candidates = linkedSetOf<String>()
 
-        val seenUrls = mutableSetOf<String>()
-        val results = mutableListOf<SearchResult>()
+        // 1. The search URL learned from the site's own search form (most faithful).
+        config?.searchUrlTemplate
+            ?.replace("{baseUrl}", base)
+            ?.replace("{query}", encoded)
+            ?.replace("{page}", page.toString())
+            ?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?.let(candidates::add)
 
-        for (link in contentLinks) {
-            if (link.url in seenUrls) continue
-            seenUrls.add(link.url)
+        // 2. A URL built from the search form in the analyzed HTML.
+        analysis?.rawHtml
+            ?.takeIf { it.isNotBlank() }
+            ?.let { html -> runCatching { Jsoup.parse(html, analysis.url.ifBlank { provider.url }) }.getOrNull() }
+            ?.let(smartNavigationEngine::findSearchForm)
+            ?.let { form -> smartNavigationEngine.buildSearchUrlFromForm(base, form, query) }
+            ?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?.let(candidates::add)
 
-            val title = link.title.takeIf { it.length > 2 }
-                ?: extractTitleFromUrl(link.url)
-                ?: continue
+        // 3. Common search URL shapes, then the provider's own pages last.
+        candidates += "$base/search?q=$encoded&page=$page"
+        candidates += "$base/?s=$encoded&paged=$page"
+        candidates += "$base/?q=$encoded&page=$page"
+        candidates += "$base/search?query=$encoded&page=$page"
+        candidates += "$base/search/$encoded"
+        candidates += "$base/find?q=$encoded&page=$page"
+        candidates += provider.url
+        candidates += "$base/"
+        return candidates.toList().take(MAX_SEARCH_CANDIDATES)
+    }
 
-            val relevanceScore = calculateRelevanceScore(title, query, url = link.url)
-            results.add(
-                SearchResult(
-                    title = title,
-                    url = link.url,
-                    thumbnailUrl = link.thumbnail,
-                    providerId = provider.id,
-                    providerName = provider.name,
-                    relevanceScore = relevanceScore
+    private suspend fun fetchFastOutcome(
+        url: String,
+        config: ScrapingConfig?,
+        query: String,
+        pageOffset: Int,
+        baseUrl: String
+    ): FetchOutcome? = supervisorScope {
+        val timeout = minOf(config?.timeout ?: DEFAULT_TIMEOUT, FAST_CANDIDATE_TIMEOUT_MS.toInt())
+        val postBody = configuredPostBody(config, url, query, pageOffset + 1, baseUrl)
+        val headers = buildRequestHeaders(config, url, baseUrl, isPost = postBody != null)
+        val native = async(Dispatchers.IO) {
+            if (!TlsClient.isAvailable) return@async null
+            val response = TlsClient.execute(
+                TlsRequest(
+                    url = url,
+                    method = if (postBody == null) "GET" else "POST",
+                    headers = headers,
+                    body = postBody ?: "",
+                    clientProfile = TlsClient.DEFAULT_PROFILE,
+                    timeoutMs = timeout
                 )
             )
+            response.body.takeIf {
+                response.error.isNullOrBlank() &&
+                    response.statusCode in 200..399 &&
+                    isUsableBody(it)
+            }?.let { body ->
+                val finalUrl = response.finalUrl.ifBlank { url }
+                FetchOutcome(
+                    document = Jsoup.parse(body, finalUrl),
+                    body = body,
+                    finalUrl = finalUrl,
+                    statusCode = response.statusCode,
+                    transport = "native-tls"
+                )
+            }
         }
-
-        // Filter through relevance gate before returning
-        validateAndFilterResults(results, query)
-            .sortedByDescending { it.relevanceScore }
-            .take(50)
-    }
-
-    /**
-     * Fetch document with retries + Cloudflare bypass fallback
-     */
-    private suspend fun fetchDocument(
-        url: String,
-        config: ScrapingConfig? = null
-    ): Document = withContext(Dispatchers.IO) {
-        var lastException: Exception? = null
-        val retryCount = config?.retryCount ?: DEFAULT_RETRY_COUNT
-        val retryDelay = config?.retryDelay ?: DEFAULT_RETRY_DELAY
-        val timeout = config?.timeout ?: DEFAULT_TIMEOUT
-
-        // ── Layer 1: Standard Jsoup fetch with retries ──
-        repeat(retryCount) { attempt ->
-            try {
+        val standard = async(Dispatchers.IO) {
+            runCatching {
                 val connection = Jsoup.connect(url)
-                    .userAgent(config?.userAgent ?: getRandomUserAgent())
+                    .headers(headers)
                     .timeout(timeout)
                     .followRedirects(true)
-                    .ignoreHttpErrors(true)   // handle 403/503 ourselves
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Accept-Encoding", "gzip, deflate, br")
-                    .header("sec-ch-ua", "\"Chromium\";v=\"132\", \"Google Chrome\";v=\"132\", \"Not-A.Brand\";v=\"99\"")
-                    .header("sec-ch-ua-mobile", "?0")
-                    .header("sec-ch-ua-platform", "\"Windows\"")
-                    .header("Sec-Fetch-Dest", "document")
-                    .header("Sec-Fetch-Mode", "navigate")
-                    .header("Sec-Fetch-Site", "none")
-                    .header("Sec-Fetch-User", "?1")
-                    .header("Upgrade-Insecure-Requests", "1")
-
-                // Add custom headers
-                config?.headers?.let { headersJson ->
-                    try {
-                        val headers = parseHeaders(headersJson)
-                        headers.forEach { (key, value) -> connection.header(key, value) }
-                    } catch (e: Exception) { /* ignore */ }
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .maxBodySize(8 * 1024 * 1024)
+                if (postBody != null) {
+                    connection.method(Connection.Method.POST)
+                    connection.requestBody(postBody)
                 }
-
-                // Add cookies (including any cached CF bypass cookies)
-                val cfCookies = cloudflareBypassEngine.getCookiesForDomain(url)
-                cfCookies.forEach { (key, value) -> connection.cookie(key, value) }
-                config?.cookies?.let { cookiesJson ->
-                    try {
-                        val cookies = parseCookies(cookiesJson)
-                        cookies.forEach { (key, value) -> connection.cookie(key, value) }
-                    } catch (e: Exception) { /* ignore */ }
-                }
-
                 val response = connection.execute()
-                val statusCode = response.statusCode()
+                val body = response.body()
+                if (response.statusCode() !in 200..399 || !isUsableBody(body)) return@runCatching null
+                val finalUrl = response.url().toString()
+                FetchOutcome(
+                    document = Jsoup.parse(body, finalUrl),
+                    body = body,
+                    finalUrl = finalUrl,
+                    statusCode = response.statusCode(),
+                    transport = "jsoup"
+                )
+            }.getOrNull()
+        }
 
-                // If we got a successful response with real content, parse and return
-                if (statusCode in 200..399) {
-                    val doc = response.parse()
-                    val html = doc.html()
-                    // Check if it's a Cloudflare challenge page
-                    if (!html.contains("Checking your browser") && !html.contains("cf_chl_opt") &&
-                        !html.contains("Just a moment") && html.length > 500) {
-                        return@withContext doc
-                    }
-                    // It's a challenge page — break to bypass layer
-                }
-                // 403/503/429 — break to bypass layer
-            } catch (e: Exception) {
-                lastException = e
-                if (attempt < retryCount - 1) {
-                    delay(retryDelay * (attempt + 1))
+        listOf(native.await(), standard.await())
+            .filterNotNull()
+            .maxWithOrNull(compareBy<FetchOutcome> { it.body.length }.thenBy { it.transport == "native-tls" })
+    }
+
+    private fun isUsableBody(body: String): Boolean {
+        if (body.length < 80) return false
+        val sample = body.take(20_000).lowercase()
+        return listOf(
+            "cf_chl_opt",
+            "checking your browser",
+            "just a moment...",
+            "enable javascript and cookies to continue"
+        ).none(sample::contains)
+    }
+
+    /**
+     * Headers for a scraping request. The configured headers/cookies from the
+     * provider's scraping config are only sent when the request stays on the
+     * config's own origin.
+     */
+    internal fun buildRequestHeaders(
+        config: ScrapingConfig?,
+        requestUrl: String,
+        baseUrl: String,
+        isPost: Boolean
+    ): Map<String, String> {
+        val headers = linkedMapOf<String, String>()
+        headers["User-Agent"] = (config?.userAgent?.takeIf { it.isNotBlank() } ?: "")
+            .ifBlank { EngineUtils.DEFAULT_USER_AGENT }
+        headers["Accept"] = "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"
+        headers["Accept-Language"] = "en-US,en;q=0.9"
+        headers["Cache-Control"] = "no-cache, no-store"
+        headers["Pragma"] = "no-cache"
+
+        if (config != null && isSameOrigin(requestUrl, baseUrl)) {
+            parseConfigEntries(config.headers).forEach { (name, value) ->
+                putHeader(headers, name, value)
+            }
+            if (headers.keys.none { it.equals("Cookie", ignoreCase = true) }) {
+                val cookieHeader = configCookies(config).entries
+                    .joinToString("; ") { "${it.key}=${it.value}" }
+                if (cookieHeader.isNotBlank()) {
+                    putHeader(headers, "Cookie", cookieHeader)
                 }
             }
         }
 
-        // ── Layer 2: Cloudflare bypass engine ──
-        try {
-            val bypassDoc = cloudflareBypassEngine.fetchJsoupDocument(url, timeout)
-            if (bypassDoc != null) return@withContext bypassDoc
-        } catch (_: Exception) {}
-
-        // ── Layer 3: Headless browser fetch ──
-        try {
-            val headlessHtml = HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(url, null, timeout)
-            if (!headlessHtml.isNullOrEmpty() && headlessHtml.length > 500) {
-                return@withContext Jsoup.parse(headlessHtml, url)
-            }
-        } catch (_: Exception) {}
-
-        throw lastException ?: Exception("Failed to fetch document after all strategies")
+        if (isPost && headers.keys.none { it.equals("Content-Type", ignoreCase = true) }) {
+            putHeader(headers, "Content-Type", "application/x-www-form-urlencoded")
+        }
+        return headers
     }
-    
+
+    private fun putHeader(headers: MutableMap<String, String>, name: String, value: String) {
+        if (name.isBlank() || value.isBlank()) return
+        val existing = headers.keys.firstOrNull { it.equals(name, ignoreCase = true) }
+        if (existing != null) headers.remove(existing)
+        headers[name] = value
+    }
+
     /**
-     * Extract results using scraping configuration
+     * Parse a config JSON blob (headers or cookies) into name/value pairs.
+     * Accepts a JSON object of primitives, or an array of {name, value} objects
+     * (also under a "cookies" key of an object).
      */
-    private fun extractResultsWithConfig(
-        document: Document,
-        provider: Provider,
-        query: String,
-        config: ScrapingConfig
-    ): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        val items = document.select(config.resultSelector)
-        
-        items.forEach { item ->
-            try {
-                val title = extractText(item, config.titleSelector)
-                val url = extractUrl(item, config.urlSelector, provider.baseUrl)
-                
-                if (title.isNotEmpty() && url.isNotEmpty()) {
-                    results.add(SearchResult(
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        title = title,
-                        url = url,
-                        description = config.descriptionSelector?.let { extractText(item, it) },
-                        thumbnailUrl = config.thumbnailSelector?.let { extractImageUrl(item, it, provider.baseUrl) },
-                        date = config.dateSelector?.let { extractText(item, it) },
-                        size = config.sizeSelector?.let { extractText(item, it) },
-                        seeders = config.seedersSelector?.let { extractNumber(item, it) },
-                        leechers = config.leechersSelector?.let { extractNumber(item, it) },
-                        rating = config.ratingSelector?.let { extractRating(item, it) },
-                        category = config.categorySelector?.let { extractText(item, it) },
-                        relevanceScore = calculateRelevanceScore(title, query)
-                    ))
+    private fun parseConfigEntries(raw: String): Map<String, String> {
+        val parsed = runCatching { json.parseToJsonElement(raw) }.getOrNull()
+            ?: return linkedMapOf()
+        val entries = linkedMapOf<String, String>()
+
+        fun addCookieArray(array: JsonArray) {
+            for (element in array) {
+                val obj = element as? JsonObject ?: continue
+                val name = (obj["name"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["key"] as? JsonPrimitive)?.contentOrNull
+                val value = (obj["value"] as? JsonPrimitive)?.contentOrNull
+                    ?: (obj["content"] as? JsonPrimitive)?.contentOrNull
+                if (!name.isNullOrBlank() && value != null) {
+                    entries[name] = value
                 }
-            } catch (e: Exception) {
-                // Skip malformed items
             }
         }
-        
-        return results.sortedByDescending { it.relevanceScore }
-    }
-    
-    /**
-     * Extract results using site analysis data
-     */
-    private fun extractResultsWithAnalysis(
-        document: Document,
-        provider: Provider,
-        query: String,
-        analysis: SiteAnalysis
-    ): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        
-        // Try to find result items
-        val itemSelector = analysis.resultItemSelector 
-            ?: detectResultItemSelector(document)
-            ?: return emptyList()
-        
-        val items = document.select(itemSelector)
-        
-        items.forEach { item ->
-            try {
-                val title = extractTitleFromItem(item, analysis)
-                val url = extractUrlFromItem(item, provider.baseUrl)
-                
-                if (title.isNotEmpty() && url.isNotEmpty()) {
-                    results.add(SearchResult(
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        title = title,
-                        url = url,
-                        description = analysis.descriptionSelector?.let { extractText(item, it) },
-                        thumbnailUrl = analysis.thumbnailSelector?.let { extractImageUrl(item, it, provider.baseUrl) },
-                        date = analysis.dateSelector?.let { extractText(item, it) },
-                        rating = analysis.ratingSelector?.let { extractRating(item, it) },
-                        relevanceScore = calculateRelevanceScore(title, query)
-                    ))
-                }
-            } catch (e: Exception) {
-                // Skip malformed items
-            }
-        }
-        
-        return results.sortedByDescending { it.relevanceScore }
-    }
-    
-    /**
-     * Generic result extraction without configuration
-     * ENHANCED: Searches in descriptions, extracts more metadata, finds related content
-     */
-    private fun extractResultsGeneric(
-        document: Document,
-        provider: Provider,
-        query: String
-    ): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        val allResults = mutableListOf<SearchResult>()
-        
-        // Try to detect result structure - expanded selectors
-        val itemSelectors = listOf(
-            ".result", ".item", ".card", ".entry", ".post",
-            ".video-item", ".movie-item", ".torrent-item",
-            "article", ".row", "[data-item]", "[data-id]",
-            ".search-result", ".listing", ".media",
-            ".thumb", ".preview", ".content-item",
-            "[class*='video']", "[class*='movie']", "[class*='result']",
-            ".grid-item", ".list-item", "li.item"
-        )
-        
-        // Find selector with most matches (but at least 2)
-        val itemSelector = itemSelectors
-            .map { it to document.select(it).size }
-            .filter { it.second >= 2 }
-            .maxByOrNull { it.second }
-            ?.first ?: return emptyList()
-            
-        val items = document.select(itemSelector)
-        
-        items.forEach { item ->
-            try {
-                val title = extractBestTitle(item)
-                val url = extractUrlFromItem(item, provider.baseUrl)
-                val description = extractBestDescription(item)
-                val thumbnail = extractBestThumbnail(item, provider.baseUrl)
-                
-                if (title.isNotEmpty() && url.isNotEmpty() && 
-                    !url.contains("javascript:") && !url.startsWith("#")) {
-                    
-                    val result = SearchResult(
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        title = title,
-                        url = url,
-                        description = description,
-                        thumbnailUrl = thumbnail,
-                        relevanceScore = calculateRelevanceScore(title, query, description, url)
-                    )
-                    
-                    allResults.add(result)
-                    
-                    // Check if matches query (title, description, or URL)
-                    if (matchesQueryEnhanced(result, query)) {
-                        results.add(result)
+
+        when (parsed) {
+            is JsonObject -> {
+                for ((key, value) in parsed) {
+                    when {
+                        value is JsonPrimitive -> value.contentOrNull?.let { entries[key] = it }
+                        value is JsonArray && key.equals("cookies", ignoreCase = true) ->
+                            addCookieArray(value)
                     }
                 }
-            } catch (e: Exception) {
-                // Skip malformed items
             }
+            is JsonArray -> addCookieArray(parsed)
+            else -> Unit
         }
-        
-        // If few direct matches, add related content
-        val uniqueResults = results.distinctBy { it.url }
-        if (uniqueResults.size < 10) {
-            val related = findRelatedContent(allResults, query, uniqueResults)
-            return (uniqueResults + related)
-                .distinctBy { it.url }
-                .sortedByDescending { it.relevanceScore }
-                .take(50)
+        return entries
+    }
+
+    private fun configCookies(config: ScrapingConfig): Map<String, String> =
+        parseConfigEntries(config.cookies)
+
+    /**
+     * The POST body for a configured search, when the provider's config carries
+     * postData AND the request URL is exactly the config's search URL template
+     * (so the body belongs to this request). Null means: plain GET.
+     */
+    internal fun configuredPostBody(
+        config: ScrapingConfig?,
+        url: String,
+        query: String,
+        page: Int,
+        baseUrl: String
+    ): String? {
+        val postData = config?.postData?.takeIf { it.isNotBlank() } ?: return null
+        val encoding = config.encoding.ifBlank { "UTF-8" }
+        val encoded = runCatching { URLEncoder.encode(query, encoding) }
+            .getOrElse { URLEncoder.encode(query, "UTF-8") }
+        val base = baseUrl.trimEnd('/')
+        val templateUrl = config.searchUrlTemplate
+            .replace("{baseUrl}", base)
+            .replace("{query}", encoded)
+            .replace("{page}", page.toString())
+        if (!url.equals(templateUrl, ignoreCase = true)) return null
+        return postData
+            .replace("{baseUrl}", base)
+            .replace("{query}", encoded)
+            .replace("{page}", page.toString())
+    }
+
+    private fun isSameOrigin(firstUrl: String, secondUrl: String): Boolean = runCatching {
+        fun effectivePort(uri: URI): Int = when {
+            uri.port >= 0 -> uri.port
+            uri.scheme.equals("https", ignoreCase = true) -> 443
+            uri.scheme.equals("http", ignoreCase = true) -> 80
+            else -> -1
         }
-        
-        return uniqueResults
+        val first = URI(firstUrl)
+        val second = URI(secondUrl)
+        first.scheme.equals(second.scheme, ignoreCase = true) &&
+            first.host.equals(second.host, ignoreCase = true) &&
+            effectivePort(first) == effectivePort(second)
+    }.getOrDefault(false)
+
+    private fun normalizeForMatching(value: String): String = value.lowercase()
+        .map { if (it.isLetterOrDigit()) it else ' ' }
+        .joinToString("")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private suspend fun extractFromFetchedOutcome(
+        outcome: FetchOutcome,
+        provider: Provider,
+        query: String,
+        config: ScrapingConfig?,
+        analysis: SiteAnalysis?
+    ): List<SearchResult> {
+        // Combine every extractor that applies to this page; the merge in
+        // searchBoundedCandidates dedupes by URL across candidates.
+        val combined = mutableListOf<SearchResult>()
+
+        val raw = outcome.body.trimStart()
+        if (raw.startsWith('{') || raw.startsWith('[')) {
+            combined += extractResultsFromJson(outcome.body, provider, query)
+        }
+        combined += extractResultsFromJsonLd(outcome.document, provider, query)
+        if (config != null) {
+            combined += runCatching { extractResultsWithConfig(outcome.document, provider, query, config) }
+                .getOrDefault(emptyList())
+        }
+        if (analysis?.resultItemSelector != null) {
+            combined += runCatching {
+                outcome.document.select(analysis.resultItemSelector).mapNotNull { item ->
+                    val title = extractBestTitle(item, query)
+                    val resultUrl = extractUrlFromItem(item, provider.baseUrl, title)
+                    if (title.length < 3 || resultUrl.isBlank()) {
+                        null
+                    } else {
+                        val cleaned = cleanExtractedTitle(title, resultUrl, query)
+                        if (cleaned.isEmpty()) null else SearchResult(
+                            providerId = provider.id,
+                            providerName = provider.name,
+                            title = cleaned,
+                            url = resultUrl,
+                            description = extractBestDescription(item),
+                            thumbnailUrl = extractBestThumbnail(item, provider.baseUrl),
+                            relevanceScore = calculateRelevanceScore(cleaned, query, extractBestDescription(item), resultUrl)
+                        )
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
+        combined += extractResultsGeneric(outcome.document, provider, query)
+
+        return combined
+            .filter { it.title.length >= 3 && it.url.startsWith("http") }
+            .filterNot { SearchResultFilter.isLikelyCategory(it.title) }
+            .filterNot { SearchResultFilter.isLikelyDuration(it.title) }
+            .distinctBy { it.url }
             .sortedByDescending { it.relevanceScore }
-            .take(50)
+            .take(TARGET_RESULTS_PER_PROVIDER)
     }
-    
-    /**
-     * Detect result item selector dynamically
-     */
-    private fun detectResultItemSelector(document: Document): String? {
-        val candidates = listOf(
-            ".result", ".item", ".card", ".entry", ".post",
-            ".video-item", ".movie-item", ".torrent-item",
-            "article", ".row", "[data-item]", "[data-id]",
-            ".search-result", ".listing", ".media"
-        )
-        
-        // Find selector with most matches (but at least 2)
-        return candidates
-            .map { it to document.select(it).size }
-            .filter { it.second >= 2 }
-            .maxByOrNull { it.second }
-            ?.first
-    }
-    
-    /**
-     * Build search URL from analysis
-     */
-    private fun buildSearchUrl(provider: Provider, query: String, analysis: SiteAnalysis): String {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        
-        // Try to find search form action
-        analysis.searchFormSelector?.let { selector ->
-            // Use detected search pattern
-        }
-        
-        // Default patterns
-        return "${provider.baseUrl}/search?q=$encodedQuery"
-    }
-    
-    // Extraction helper methods
-    private fun extractText(element: Element, selector: String): String {
-        return element.select(selector).firstOrNull()?.text()?.trim() ?: ""
-    }
-    
-    private fun extractUrl(element: Element, selector: String, baseUrl: String): String {
-        val href = element.select(selector).firstOrNull()?.attr("href") ?: ""
-        return normalizeUrl(href, baseUrl)
-    }
-    
-    private fun extractImageUrl(element: Element, selector: String, baseUrl: String): String? {
-        val img = element.select(selector).firstOrNull()
-        val src = img?.attr("src") 
-            ?: img?.attr("data-src") 
-            ?: img?.attr("data-lazy-src")
-            ?: return null
-        return normalizeUrl(src, baseUrl)
-    }
-    
-    private fun extractNumber(element: Element, selector: String): Int? {
-        val text = extractText(element, selector)
-        return text.replace(Regex("[^0-9]"), "").toIntOrNull()
-    }
-    
-    private fun extractRating(element: Element, selector: String): Float? {
-        val text = extractText(element, selector)
-        return text.replace(Regex("[^0-9.]"), "").toFloatOrNull()
-    }
-    
-    private fun extractTitleFromItem(item: Element, analysis: SiteAnalysis): String {
-        // Try analysis selector first
-        analysis.titleSelector?.let { selector ->
-            val text = item.select(selector).text().trim()
-            if (text.isNotEmpty()) return text
-        }
-        return extractBestTitle(item)
-    }
-    
-    private fun extractBestTitle(item: Element): String {
-        // Try common title patterns
-        val selectors = listOf(
-            "h1", "h2", "h3", "h4", ".title", ".name", 
-            "[class*='title']", "[class*='name']", "a[title]"
-        )
-        
-        for (selector in selectors) {
-            val text = item.select(selector).firstOrNull()?.text()?.trim()
-            if (!text.isNullOrEmpty() && text.length > 2 && text.length < 500) {
-                return text
-            }
-        }
-        
-        // Fallback to first link text
-        return item.select("a").firstOrNull()?.text()?.trim() ?: ""
-    }
-    
-    private fun extractUrlFromItem(item: Element, baseUrl: String): String {
-        // Look for the main link
-        val link = item.select("a[href]").firstOrNull()
-            ?: item.select("a").firstOrNull()
-        val href = link?.attr("href") ?: ""
-        return normalizeUrl(href, baseUrl)
-    }
-    
-    private fun extractBestDescription(item: Element): String? {
-        val selectors = listOf(
-            ".description", ".desc", ".synopsis", ".summary",
-            "[class*='description']", "p", ".info"
-        )
-        
-        for (selector in selectors) {
-            val text = item.select(selector).firstOrNull()?.text()?.trim()
-            if (!text.isNullOrEmpty() && text.length > 10) {
-                return text.take(500)
-            }
-        }
-        return null
-    }
-    
-    private fun extractBestThumbnail(item: Element, baseUrl: String): String? {
-        // 1. Try all img attributes in priority order
-        val img = item.select("img").firstOrNull()
-        val imgSrc = img?.attr("src")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-lazy-src")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-original")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-poster")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-thumbnail")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-bg")?.takeIf { it.isNotEmpty() }
 
-        if (!imgSrc.isNullOrEmpty() && isValidThumbnailUrl(imgSrc)) {
-            return normalizeUrl(imgSrc, baseUrl)
-        }
+    private fun extractResultsFromJson(body: String, provider: Provider, query: String): List<SearchResult> {
+        val root = runCatching { json.parseToJsonElement(body) }.getOrNull() ?: return emptyList()
+        val objects = mutableListOf<JsonObject>()
 
-        // 2. Any img anywhere in the item
-        item.select("img[src]").forEach { el ->
-            val src = el.attr("src").takeIf { it.isNotEmpty() } ?: return@forEach
-            if (isValidThumbnailUrl(src)) return normalizeUrl(src, baseUrl)
-        }
-
-        // 3. data-* attributes on any element that look like image URLs
-        item.allElements.forEach { el ->
-            listOf("data-src", "data-image", "data-thumb", "data-poster",
-                   "data-thumbnail", "data-bg", "data-background").forEach { attr ->
-                val v = el.attr(attr).takeIf { it.isNotEmpty() } ?: return@forEach
-                if (isValidThumbnailUrl(v)) return normalizeUrl(v, baseUrl)
-            }
-        }
-
-        // 4. CSS background-image inline style
-        item.allElements.forEach { el ->
-            val style = el.attr("style")
-            if (style.contains("background-image", ignoreCase = true)) {
-                val match = Regex("""url\(['"]?([^'")\s]+)['"]?\)""").find(style)
-                val url = match?.groupValues?.getOrNull(1)
-                if (!url.isNullOrEmpty() && isValidThumbnailUrl(url)) {
-                    return normalizeUrl(url, baseUrl)
+        fun walk(element: JsonElement, depth: Int) {
+            if (depth > 8 || objects.size >= 500) return
+            when (element) {
+                is JsonObject -> {
+                    objects += element
+                    element.values.forEach { walk(it, depth + 1) }
                 }
+                is JsonArray -> element.forEach { walk(it, depth + 1) }
+                else -> Unit
+            }
+        }
+        walk(root, 0)
+
+        fun JsonObject.elementFor(vararg keys: String): JsonElement? = entries
+            .firstOrNull { entry -> keys.any { it.equals(entry.key, ignoreCase = true) } }
+            ?.value
+        fun JsonElement?.stringValue(): String? = when (this) {
+            is JsonPrimitive -> contentOrNull
+            is JsonObject -> elementFor("url", "src", "href")?.stringValue()
+            is JsonArray -> firstOrNull()?.stringValue()
+            else -> null
+        }
+
+        return objects.mapNotNull { item ->
+            val title = item.elementFor("title", "name", "headline", "label")
+                .stringValue()?.trim().orEmpty()
+            val rawUrl = item.elementFor(
+                "url", "link", "href", "permalink", "webpage_url", "canonicalUrl"
+            ).stringValue()?.trim().orEmpty()
+            if (title.length < 3 || rawUrl.isBlank()) return@mapNotNull null
+            val resultUrl = normalizeUrl(rawUrl, provider.baseUrl)
+            if (!resultUrl.startsWith("http")) return@mapNotNull null
+            val cleaned = cleanExtractedTitle(title, resultUrl, query)
+            if (cleaned.isEmpty()) return@mapNotNull null
+            val description = item.elementFor("description", "summary", "excerpt", "snippet").stringValue()
+            SearchResult(
+                providerId = provider.id,
+                providerName = provider.name,
+                title = cleaned,
+                url = resultUrl,
+                description = description,
+                thumbnailUrl = item.elementFor(
+                    "thumbnail", "thumbnailUrl", "image", "poster", "cover", "artwork"
+                ).stringValue()?.let { normalizeUrl(it, provider.baseUrl) },
+                category = item.elementFor("category", "type", "genre").stringValue(),
+                duration = item.elementFor("duration", "length").stringValue(),
+                quality = item.elementFor("quality", "resolution").stringValue(),
+                relevanceScore = calculateRelevanceScore(cleaned, query, description, resultUrl)
+            )
+        }
+            .filterNot { SearchResultFilter.isLikelyCategory(it.title) }
+            .filterNot { SearchResultFilter.isLikelyDuration(it.title) }
+            .distinctBy { it.url }
+            .take(150)
+    }
+
+    /**
+     * Extract results from schema.org JSON-LD blocks (VideoObject, Movie, ...)
+     * embedded in the page. Many video sites describe their real results there
+     * even when the visible list is rendered by script.
+     */
+    private fun extractResultsFromJsonLd(document: Document, provider: Provider, query: String): List<SearchResult> {
+        val objects = mutableListOf<JsonObject>()
+
+        fun walk(element: JsonElement, depth: Int) {
+            if (depth > 12 || objects.size >= 1000) return
+            when (element) {
+                is JsonObject -> {
+                    objects += element
+                    element.values.forEach { walk(it, depth + 1) }
+                }
+                is JsonArray -> element.forEach { walk(it, depth + 1) }
+                else -> Unit
             }
         }
 
-        return null
+        document.select("script[type=application/ld+json]").forEach { script ->
+            val content = script.data().ifBlank { script.html() }
+            if (content.isBlank()) return@forEach
+            runCatching { json.parseToJsonElement(content) }.getOrNull()?.let { walk(it, 0) }
+        }
+
+        fun JsonObject.elementFor(vararg keys: String): JsonElement? = entries
+            .firstOrNull { entry -> keys.any { it.equals(entry.key, ignoreCase = true) } }
+            ?.value
+        fun JsonElement?.textValue(): String? = when (this) {
+            is JsonPrimitive -> contentOrNull
+            is JsonObject -> elementFor("url", "@id", "href", "name")?.textValue()
+            is JsonArray -> firstNotNullOfOrNull { it.textValue() }
+            else -> null
+        }
+        fun JsonElement?.values(): List<String> = when (this) {
+            is JsonPrimitive -> listOfNotNull(contentOrNull)
+            is JsonArray -> flatMap { it.values() }
+            else -> emptyList()
+        }
+
+        val contentTypes = setOf(
+            "videoobject", "movie", "tvepisode", "tvseries", "clip",
+            "musicvideoobject", "podcastepisode", "podcastseries", "creativework"
+        )
+        val mediaExtensions = setOf(".m3u8", ".mp4", ".m4v", ".webm", ".mov", ".mpd", ".ts")
+
+        return objects.mapNotNull { item ->
+            val types = item.elementFor("@type")?.values()
+                ?.map { it.substringAfterLast('/').substringAfterLast('#').lowercase() }
+                .orEmpty()
+            if (types.none { it in contentTypes }) return@mapNotNull null
+
+            val title = item.elementFor("name", "headline")?.textValue()?.trim().orEmpty()
+            val rawUrl = item.elementFor("url", "mainEntityOfPage", "@id")?.textValue()?.trim().orEmpty()
+            if (title.length < 3 || rawUrl.isBlank()) return@mapNotNull null
+            val resultUrl = normalizeUrl(rawUrl, provider.baseUrl)
+            if (!resultUrl.startsWith("http", ignoreCase = true)) return@mapNotNull null
+
+            // Direct media files are not result pages.
+            val path = runCatching { (URI(resultUrl).path ?: "").lowercase() }.getOrDefault("")
+            if (mediaExtensions.any { path.endsWith(it) }) return@mapNotNull null
+
+            val cleaned = cleanExtractedTitle(title, resultUrl, query)
+            if (cleaned.isEmpty() ||
+                SearchResultFilter.isLikelyCategory(cleaned) ||
+                SearchResultFilter.isLikelyDuration(cleaned)
+            ) return@mapNotNull null
+
+            val description = item.elementFor("description", "abstract")?.textValue()
+            SearchResult(
+                providerId = provider.id,
+                providerName = provider.name,
+                title = cleaned,
+                url = resultUrl,
+                description = description,
+                thumbnailUrl = item.elementFor("thumbnailUrl", "image")?.textValue()
+                    ?.let { normalizeUrl(it, provider.baseUrl) },
+                category = item.elementFor("genre")?.values()?.joinToString(", "),
+                date = item.elementFor("uploadDate", "datePublished", "dateCreated")?.textValue(),
+                duration = item.elementFor("duration")?.textValue(),
+                relevanceScore = calculateRelevanceScore(cleaned, query, description, resultUrl)
+            )
+        }.distinctBy { it.url }
     }
 
-    private fun isValidThumbnailUrl(src: String): Boolean {
-        if (src.isBlank()) return false
-        val lower = src.lowercase()
-        // Reject obvious non-image / placeholder patterns
-        val rejectPatterns = listOf(
-            "placeholder", "blank.gif", "blank.png", "spacer", "pixel.gif",
-            "1x1", "transparent", "data:image/gif", "javascript:", "#"
-        )
-        if (rejectPatterns.any { lower.contains(it) }) return false
-        // Accept if it has an image extension or looks like a CDN image path
-        val acceptPatterns = listOf(
-            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp",
-            "/thumb", "/poster", "/cover", "/image", "/img", "/photo",
-            "tmdb.org", "imdb.com", "tvdb.com", "fanart.tv", "thetvdb.com"
-        )
-        return acceptPatterns.any { lower.contains(it) } || src.startsWith("http")
-    }
-    
-    /**
-     * Calculate relevance score for ranking results.
-     * Considers title, optional description, and URL path keywords.
-     */
-    private fun calculateRelevanceScore(
-        title: String,
-        query: String,
-        description: String? = null,
-        url: String? = null
-    ): Float {
-        val titleLower = title.lowercase()
-        val queryLower = query.lowercase()
-        val queryTerms = queryLower.split(Regex("\\s+")).filter { it.length > 1 }
-
-        if (queryTerms.isEmpty()) return 5f
+    private fun calculateRelevanceScore(title: String, query: String, description: String? = null, url: String? = null): Float {
+        val normalizedTitle = normalizeForMatching(title)
+        val normalizedQuery = normalizeForMatching(query)
+        val normalizedDescription = normalizeForMatching(description ?: "")
+        val terms = normalizedQuery.split(' ').filter { it.length >= 2 }.distinct()
+        if (terms.isEmpty()) return 0f
 
         var score = 0f
+        if (normalizedQuery.length >= 3 && normalizedTitle.contains(normalizedQuery)) score += 50f
+        if (normalizedQuery.length >= 3 && normalizedDescription.contains(normalizedQuery)) score += 12f
 
-        // Exact phrase match bonus
-        if (titleLower.contains(queryLower)) {
-            score += 50f
-        }
+        val titleWords = normalizedTitle.split(' ')
+        val descriptionWords = normalizedDescription.split(' ')
+        val titleHits = terms.count { titleWords.contains(it) }
+        val descriptionHits = terms.count { descriptionWords.contains(it) }
+        score += titleHits * 12f
+        score += descriptionHits * 4f
+        if (titleHits == terms.size) score += 12f
+        if (normalizedTitle.startsWith(terms.first())) score += 4f
 
-        // Individual term matching in title
-        var matchedTerms = 0
-        queryTerms.forEach { term ->
-            if (titleLower.contains(term)) {
-                matchedTerms++
-                score += 10f
-
-                // Bonus for term at start
-                if (titleLower.startsWith(term)) score += 15f
-
-                // Position-based bonus: earlier is better
-                val pos = titleLower.indexOf(term)
-                score += maxOf(0f, 5f - pos / 20f)
-            }
-        }
-
-        // Ratio of matched terms
-        val matchRatio = matchedTerms.toFloat() / queryTerms.size
-        score += matchRatio * 25f
-
-        // Description matching (weighted at 40% of title)
-        if (!description.isNullOrBlank()) {
-            val descLower = description.lowercase()
-            if (descLower.contains(queryLower)) score += 20f
-            var descMatched = 0
-            queryTerms.forEach { term ->
-                if (descLower.contains(term)) descMatched++
-            }
-            score += (descMatched.toFloat() / queryTerms.size) * 10f
-        }
-
-        // URL path matching (slug keywords)
-        if (!url.isNullOrBlank()) {
-            try {
-                val path = java.net.URL(url).path
-                    .lowercase()
-                    .replace("-", " ")
-                    .replace("_", " ")
-                    .replace("/", " ")
-                var urlMatched = 0
-                queryTerms.forEach { term ->
-                    if (path.contains(term)) urlMatched++
-                }
-                score += (urlMatched.toFloat() / queryTerms.size) * 8f
-            } catch (_: Exception) {}
-        }
-
-        // Penalize very long titles (likely spam or navigation text)
-        if (title.length > 120) score -= 8f
-
-        // Word order bonus
-        if (queryTerms.size > 1) {
-            val pattern = queryTerms.joinToString(".*")
-            if (titleLower.matches(Regex(".*$pattern.*"))) score += 10f
-        }
-
-        // Fuzzy / partial stem match if no direct match
-        if (matchedTerms == 0) {
-            var fuzzyHits = 0
-            queryTerms.forEach { term ->
-                if (term.length >= 4) {
-                    val stem = term.take(term.length - 1)
-                    if (titleLower.contains(stem)) fuzzyHits++
-                }
-            }
-            if (fuzzyHits > 0) score += fuzzyHits * 3f
-        }
-
-        // ── NLP SEMANTIC SCORING BOOST ──────────────────────────────────
-        // If the NLP processor has analysed the query, add a semantic
-        // similarity component that understands concept relationships.
-        // This is especially important for natural language queries where
-        // the raw keywords may not appear in the result at all but the
-        // semantic concepts do (e.g. "scared my cat" → title "cat jump scare").
-        val processed = currentProcessedQuery
-        if (processed != null) {
-            val semanticScore = nlpProcessor.calculateSemanticRelevance(
-                title, description, processed.concepts
-            )
-            // Blend: if keyword matching found nothing, semantic can carry; otherwise it boosts
-            if (matchedTerms == 0) {
-                // Keyword matching failed — lean heavily on semantic understanding
-                score += semanticScore * 0.8f
-            } else {
-                // Keywords matched too — add a modest semantic boost
-                score += semanticScore * 0.3f
-            }
+        // NLP semantic boost
+        currentProcessedQuery?.let {
+            score += 0.5f * nlpProcessor.calculateSemanticRelevance(title, description, it.concepts)
         }
 
         return score.coerceIn(0f, 100f)
     }
-    
-    // Alternative scraping methods
-    
-    /**
-     * Scrape provider's homepage/landing page as ultimate fallback
-     * When search returns nothing, the homepage often has trending/popular/latest content
-     * Returns all extractable content from the homepage, letting RankingEngine sort by relevance
-     */
-    private suspend fun scrapeProviderHomepage(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val homepageUrls = listOf(
-            provider.baseUrl,
-            provider.baseUrl.trimEnd('/') + "/",
-            provider.baseUrl.trimEnd('/') + "/home",
-            provider.baseUrl.trimEnd('/') + "/latest",
-            provider.baseUrl.trimEnd('/') + "/new",
-            provider.baseUrl.trimEnd('/') + "/trending",
-            provider.baseUrl.trimEnd('/') + "/popular"
-        )
-        
-        for (homepageUrl in homepageUrls) {
-            try {
-                val document = fetchDocument(homepageUrl)
-                
-                // Extract content from homepage, then keep only results that
-                // actually match the user's query — never return random trending/latest
-                val allResults = extractAllContentFromPage(document, provider)
-                if (allResults.isNotEmpty()) {
-                    val relevant = allResults
-                        .filter { matchesQueryEnhanced(it, query) }
-                        .map { result ->
-                            result.copy(relevanceScore = calculateRelevanceScore(result.title, query))
-                        }
-                        .sortedByDescending { it.relevanceScore }
-                    if (relevant.isNotEmpty()) {
-                        return@withContext relevant
-                    }
-                }
-            } catch (e: Exception) {
-                continue
-            }
-        }
-        emptyList()
+
+    private fun matchesQueryEnhanced(result: SearchResult, query: String): Boolean {
+        return SearchResultFilter.hasQueryAffinity(result, query, currentProcessedQuery)
     }
-    
-    /**
-     * Extract ALL content links from a page without query filtering
-     * Used for homepage scraping to get whatever content the provider has
-     */
-    private fun extractAllContentFromPage(document: Document, provider: Provider): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        val seenUrls = mutableSetOf<String>()
 
-        // Use SmartNavigationEngine to find content links (fixed destructuring)
-        val contentLinks = smartNavigationEngine.extractContentLinks(document, provider.baseUrl)
-        for (contentLink in contentLinks) {
-            val url = contentLink.url
-            if (url in seenUrls) continue
-            seenUrls.add(url)
-
-            val title = contentLink.title.takeIf { it.length > 2 }
-                ?: extractTitleFromUrl(url)
-                ?: findTitleInDocument(document, url)
-                ?: continue
-            if (title.length < 3) continue
-
-            val description = findDescriptionInDocument(document, url)
-
-            results.add(SearchResult(
-                title = title,
+    private fun extractResultsWithConfig(doc: Document, p: Provider, q: String, c: ScrapingConfig): List<SearchResult> {
+        return doc.select(c.resultSelector).mapNotNull { item ->
+            val title = extractConfiguredTitle(item, c.titleSelector, q)
+            val url = extractUrl(item, c.urlSelector, p.baseUrl)
+            if (title.isEmpty() || url.isEmpty()) return@mapNotNull null
+            val cleaned = cleanExtractedTitle(title, url, q)
+            if (cleaned.isEmpty()) return@mapNotNull null
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = cleaned,
                 url = url,
-                thumbnailUrl = contentLink.thumbnail,  // correct field
-                description = description,
-                providerId = provider.id,
-                providerName = provider.name,
-                relevanceScore = 0f
-            ))
+                description = c.descriptionSelector?.let { extractText(item, it) },
+                thumbnailUrl = c.thumbnailSelector?.let { extractImageUrl(item, it, p.baseUrl) },
+                relevanceScore = calculateRelevanceScore(cleaned, q, null, url)
+            )
         }
-        
-        // Also try generic extraction for any missed items
-        val itemSelectors = listOf(
-            "article a[href]", ".card a[href]", ".item a[href]", 
-            ".video-item a[href]", ".movie-item a[href]",
-            ".post a[href]", ".entry a[href]", ".thumb a[href]",
-            "[class*='video'] a[href]", "[class*='movie'] a[href]",
-            ".grid-item a[href]", ".list-item a[href]"
-        )
-        
-        for (selector in itemSelectors) {
-            try {
-                val elements = document.select(selector)
-                for (element in elements) {
-                    val href = element.attr("href")
-                    val url = normalizeUrl(href, provider.baseUrl)
-                    if (url in seenUrls || url.contains("javascript:") || url.startsWith("#")) continue
-                    
-                    // Skip category/navigation URLs
-                    if (CATEGORY_URL_PATTERNS.any { url.lowercase().contains(it) }) continue
-                    
-                    // Prefer content URLs
-                    val isContentUrl = CONTENT_URL_PATTERNS.any { url.lowercase().contains(it) }
-                    
-                    val title = element.text().trim().takeIf { it.length > 2 }
-                        ?: extractTitleFromUrl(url)
-                        ?: continue
-                    
-                    if (title.lowercase().trim() in GENERIC_CATEGORY_NAMES) continue
-                    
-                    seenUrls.add(url)
-                    
-                    // Find thumbnail nearby
-                    val thumbnail = element.select("img").firstOrNull()?.let { img ->
-                        val src = img.attr("src").takeIf { it.isNotEmpty() }
-                            ?: img.attr("data-src").takeIf { it.isNotEmpty() }
-                            ?: img.attr("data-lazy-src").takeIf { it.isNotEmpty() }
-                        src?.let { normalizeUrl(it, provider.baseUrl) }
-                    }
-                    
-                    results.add(SearchResult(
+    }
+
+    private fun extractResultsGeneric(doc: Document, p: Provider, q: String): List<SearchResult> {
+        val selectorResults = detectResultItemSelector(doc)?.let { selector ->
+            doc.select(selector).mapNotNull { item ->
+                val title = extractBestTitle(item, q)
+                val u = extractUrlFromItem(item, p.baseUrl, title)
+                if (title.isEmpty() || u.isEmpty() || u.contains("javascript:")) null
+                else {
+                    // extractBestDescription is a pure read of the item; compute
+                    // once instead of once per use below.
+                    val description = extractBestDescription(item)
+                    SearchResult(
+                        providerId = p.id,
+                        providerName = p.name,
                         title = title,
-                        url = url,
-                        thumbnailUrl = thumbnail,
-                        description = null,
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        relevanceScore = if (isContentUrl) 10f else 5f
-                    ))
+                        url = u,
+                        description = description,
+                        thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
+                        relevanceScore = calculateRelevanceScore(title, q, description, u)
+                    )
                 }
-            } catch (e: Exception) {
-                continue
             }
-        }
-        
-        return results.distinctBy { it.url }.take(100)
-    }
-    
-    /**
-     * Try searching with decomposed query - individual keywords when full query fails
-     * Useful when sites have limited search that doesn't handle multi-word queries well
-     */
-    private suspend fun searchWithDecomposedQuery(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        // ── NLP-enhanced decomposition ──────────────────────────────────
-        // Instead of naively splitting the raw query into individual keywords,
-        // use the NLP-generated search queries which are semantically meaningful
-        // and formatted to match how content is actually titled on the web.
-        val processed = currentProcessedQuery
-        val searchTerms: List<String> = if (processed != null && processed.searchQueries.isNotEmpty()) {
-            // Use up to 5 of the best NLP-generated queries
-            processed.searchQueries.take(5)
-        } else {
-            // Fallback: split raw query into individual keywords
-            val keywords = query.lowercase()
-                .split(Regex("\\s+"))
-                .filter { it.length > 2 }
-                .distinct()
-            if (keywords.size <= 1) return@withContext emptyList()
-            keywords.take(3)
+        }.orEmpty()
+
+        val contentLinkResults = smartNavigationEngine.extractContentLinks(doc, p.baseUrl).mapNotNull { link ->
+            val title = link.title.takeIf { it.length > 2 } ?: extractTitleFromUrl(link.url) ?: return@mapNotNull null
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = link.url,
+                thumbnailUrl = link.thumbnail,
+                duration = link.duration,
+                relevanceScore = calculateRelevanceScore(title, q, url = link.url)
+            )
         }
 
-        val allResults = mutableListOf<SearchResult>()
-        val seenUrls = mutableSetOf<String>()
-
-        for (searchTerm in searchTerms) {
+        val parsedResults = runBlocking {
             try {
-                val searchPatterns = listOf(
-                    "${provider.baseUrl}/search?q=${URLEncoder.encode(searchTerm, "UTF-8")}",
-                    "${provider.baseUrl}/search?query=${URLEncoder.encode(searchTerm, "UTF-8")}",
-                    "${provider.baseUrl}/search/${URLEncoder.encode(searchTerm, "UTF-8")}",
-                    "${provider.baseUrl}/?s=${URLEncoder.encode(searchTerm, "UTF-8")}"
-                )
+                universalFormatParser.parseContent(doc, doc.location().ifEmpty { p.baseUrl }).items
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }.mapNotNull { item ->
+            val title = item.title.trim()
+            val u = normalizeUrl(item.url, p.baseUrl)
+            if (title.length < 3 || u.isEmpty() || u.contains("javascript:")) null
+            else SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = u,
+                description = item.description,
+                thumbnailUrl = item.thumbnail?.let { normalizeUrl(it, p.baseUrl) },
+                duration = item.duration,
+                quality = item.quality,
+                category = item.contentType.name.lowercase(),
+                relevanceScore = calculateRelevanceScore(title, q, item.description, u)
+            )
+        }
 
-                for (pattern in searchPatterns) {
-                    try {
-                        val document = fetchDocument(pattern)
-                        val results = extractResultsGeneric(document, provider, query)
-                        for (result in results) {
-                            if (result.url !in seenUrls) {
-                                seenUrls.add(result.url)
-                                // Re-score against the FULL original query
-                                allResults.add(result.copy(
-                                    relevanceScore = calculateRelevanceScore(result.title, query)
-                                ))
-                            }
+        return (selectorResults + contentLinkResults + parsedResults)
+            .distinctBy { it.url }
+            .sortedByDescending { it.relevanceScore }
+    }
+
+    private fun detectResultItemSelector(doc: Document): String? {
+        val candidates = listOf(
+            ".video-item", ".movie-item", ".search-result-item", ".result-item",
+            ".result", ".item", ".card", ".entry", "article"
+        )
+        val scored = candidates.mapNotNull { selector ->
+            val elements = runCatching { doc.select(selector) }.getOrNull()
+                ?: return@mapNotNull null
+            val count = elements.count { element ->
+                extractBestTitle(element, "").isNotBlank() &&
+                    runCatching {
+                        element.select("a[href]").any { link ->
+                            val href = link.attr("href").trim()
+                            href.isNotBlank() &&
+                                !href.startsWith("javascript:", ignoreCase = true) &&
+                                !href.startsWith("mailto:", ignoreCase = true)
                         }
-                        if (results.isNotEmpty()) break // Got results for this search term
-                    } catch (e: Exception) {
-                        continue
-                    }
-                }
-            } catch (e: Exception) {
-                continue
+                    }.getOrDefault(false)
             }
+            if (count >= 2) selector to count else null
         }
+        return scored.maxWithOrNull(
+            compareBy<Pair<String, Int>> { it.second }.thenBy { it.first.length }
+        )?.first
+    }
 
-        allResults.sortedByDescending { it.relevanceScore }
-    }
-    
-    private suspend fun scrapeWithAlternateUserAgent(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val url = "${provider.baseUrl}/search?q=${URLEncoder.encode(query, "UTF-8")}"
-        USER_AGENTS.shuffled().forEach { userAgent ->
-            try {
-                val document = Jsoup.connect(url)
-                    .userAgent(userAgent)
-                    .timeout(DEFAULT_TIMEOUT)
-                    .get()
-                val results = extractResultsGeneric(document, provider, query)
-                if (results.isNotEmpty()) {
-                    return@withContext results
-                }
-            } catch (e: Exception) {
-                // Try next user agent
+    private fun extractBestTitle(item: Element, query: String): String {
+        val selectors = listOf(
+            "[itemprop=name]", "[data-title]", ".video-title", ".movie-title",
+            ".item-title", ".entry-title", "h2", "h3", "h4", ".title", ".name",
+            "[class*='title']", "a[title]", "a", "img[alt]"
+        )
+        val candidates = mutableListOf<Pair<String, Int>>()
+        selectors.forEachIndexed { index, selector ->
+            runCatching { item.select(selector).take(10) }.getOrDefault(emptyList())
+                .forEach { element -> candidates += titleValues(element, index * 6) }
+        }
+        val linkTitles = runCatching { item.select("a[href]").take(5) }.getOrDefault(emptyList())
+            .mapIndexedNotNull { index, element ->
+                extractTitleFromUrl(element.absUrl("href"))?.let { it to (index + 80) }
             }
-        }
-        emptyList()
+        return chooseBestTitle(candidates + linkTitles, query)
     }
-    
-    private suspend fun scrapeWithDelay(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        delay(2000) // Wait before retry
-        scrapeGeneric(provider, query)
+
+    private fun extractConfiguredTitle(item: Element, selector: String, query: String): String {
+        val candidates = mutableListOf<Pair<String, Int>>()
+        runCatching { item.select(selector).take(20) }.getOrDefault(emptyList())
+            .forEachIndexed { index, element -> candidates += titleValues(element, index * 6) }
+        return chooseBestTitle(candidates, query).ifBlank { extractBestTitle(item, query) }
     }
-    
-    private suspend fun scrapeMobileVersion(
-        provider: Provider,
-        query: String
-    ): List<SearchResult> = withContext(Dispatchers.IO) {
-        val mobileUrl = provider.baseUrl
-            .replace("www.", "m.")
-            .replace("://", "://m.")
-        val searchUrl = "$mobileUrl/search?q=${URLEncoder.encode(query, "UTF-8")}"
-        
-        try {
-            val document = Jsoup.connect(searchUrl)
-                .userAgent(EngineUtils.getRandomUserAgent())
-                .timeout(DEFAULT_TIMEOUT)
-                .get()
-            extractResultsGeneric(document, provider, query)
-        } catch (e: Exception) {
-            emptyList()
-        }
-    }
-    
-    // Utility methods
-    private fun normalizeUrl(url: String, baseUrl: String): String {
-        return when {
-            url.startsWith("http") -> url
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$baseUrl$url"
-            else -> "$baseUrl/$url"
-        }
-    }
-    
-    private fun enforceRateLimit(providerId: String) {
-        val lastTime = lastRequestTime[providerId] ?: 0L
-        val elapsed = System.currentTimeMillis() - lastTime
-        if (elapsed < DEFAULT_RATE_LIMIT_MS) {
-            Thread.sleep(DEFAULT_RATE_LIMIT_MS - elapsed)
-        }
-        lastRequestTime[providerId] = System.currentTimeMillis()
-    }
-    
-    private fun updateProviderHealth(providerId: String, success: Boolean, responseTime: Long) {
-        val current = providerHealthMap.getOrPut(providerId) { ProviderHealth() }
-        val newHealth = if (success) {
-            current.copy(
-                successCount = current.successCount + 1,
-                avgResponseTime = (current.avgResponseTime + responseTime) / 2,
-                lastSuccess = System.currentTimeMillis()
-            )
+
+    private fun titleValues(element: Element, priority: Int): List<Pair<String, Int>> {
+        val itempropValue = if (element.attr("itemprop").equals("name", ignoreCase = true)) {
+            element.attr("content").ifBlank { element.text() }
         } else {
-            current.copy(
-                failureCount = current.failureCount + 1,
-                lastFailure = System.currentTimeMillis()
-            )
+            ""
         }
-        providerHealthMap[providerId] = newHealth
+        return listOf(
+            element.attr("data-title") to priority,
+            itempropValue to (priority + 1),
+            element.attr("title") to (priority + 2),
+            element.attr("aria-label") to (priority + 3),
+            element.attr("alt") to (priority + 4),
+            element.text() to (priority + 5)
+        ).filter { it.first.isNotBlank() }
     }
-    
-    private fun getRandomUserAgent(): String = EngineUtils.getRandomUserAgent()
-    
-    private fun parseHeaders(json: String): Map<String, String> {
-        // Simple JSON parsing for headers
-        return try {
-            val cleaned = json.trim().removeSurrounding("{", "}")
-            cleaned.split(",")
-                .map { it.split(":").map { p -> p.trim().removeSurrounding("\"") } }
-                .filter { it.size == 2 }
-                .associate { it[0] to it[1] }
-        } catch (e: Exception) {
-            emptyMap()
+
+    private fun chooseBestTitle(candidates: List<Pair<String, Int>>, query: String): String {
+        val normalizedQuery = normalizeForMatching(query)
+        val queryTerms = normalizedQuery.split(' ').filter { it.length >= 2 }
+        val conceptWords = currentProcessedQuery?.conceptTerms
+            ?.flatMap { normalizeForMatching(it).split(' ') }
+            ?.filter { it.length >= 3 }
+            .orEmpty()
+
+        val scored = candidates.mapNotNull { (rawTitle, priority) ->
+            val cleaned = rawTitle.replace(Regex("\\s+"), " ").trim()
+            if (cleaned.length < 3 ||
+                SearchResultFilter.isLikelyCategory(cleaned) ||
+                SearchResultFilter.isLikelyDuration(cleaned)
+            ) {
+                return@mapNotNull null
+            }
+            val normalized = normalizeForMatching(cleaned)
+            val words = normalized.split(' ')
+            val termHits = queryTerms.count { words.contains(it) }
+            val conceptHits = conceptWords.count { normalized.contains(it) }
+            val phraseBonus = if (normalizedQuery.length >= 3 && normalized.contains(normalizedQuery)) 80 else 0
+            cleaned to ((termHits * 40 + phraseBonus + conceptHits * 12) - priority)
         }
+        return scored.maxByOrNull { it.second }?.first ?: ""
     }
-    
-    private fun parseCookies(json: String): Map<String, String> = parseHeaders(json)
-    
-    data class ProviderHealth(
-        val successCount: Int = 0,
-        val failureCount: Int = 0,
-        val avgResponseTime: Long = 0,
-        val lastSuccess: Long = 0,
-        val lastFailure: Long = 0
-    )
+
+    private fun cleanExtractedTitle(title: String, url: String, query: String): String {
+        val cleaned = title.replace(Regex("\\s+"), " ").trim()
+        if (cleaned.length >= 3 &&
+            !SearchResultFilter.isLikelyDuration(cleaned) &&
+            !SearchResultFilter.isLikelyCategory(cleaned)
+        ) {
+            return cleaned
+        }
+        return extractTitleFromUrl(url)?.takeIf {
+            it.length >= 3 &&
+                !SearchResultFilter.isLikelyDuration(it) &&
+                !SearchResultFilter.isLikelyCategory(it)
+        } ?: ""
+    }
+
+    private fun extractUrlFromItem(item: Element, base: String, preferredTitle: String = ""): String {
+        val links = runCatching { item.select("a[href]") }.getOrDefault(emptyList())
+            .filter { element ->
+                val href = element.attr("href").trim()
+                href.isNotEmpty() &&
+                    !href.startsWith("javascript:", ignoreCase = true) &&
+                    !href.startsWith("mailto:", ignoreCase = true)
+            }
+        if (links.isEmpty()) return ""
+
+        val normalizedTitle = normalizeForMatching(preferredTitle)
+        val best = links.maxByOrNull { element ->
+            val label = listOf(
+                element.attr("title"),
+                element.attr("aria-label"),
+                element.text()
+            ).firstOrNull { it.isNotBlank() } ?: ""
+            val normalizedLabel = normalizeForMatching(label)
+            var score = 0
+            if (normalizedTitle.isNotBlank() && normalizedLabel.isNotBlank() &&
+                (normalizedLabel.contains(normalizedTitle) || normalizedTitle.contains(normalizedLabel))
+            ) {
+                score += 100
+            }
+            val imgAlt = element.selectFirst("img[alt]")?.attr("alt")
+                ?.let { normalizeForMatching(it) } ?: ""
+            if (normalizedTitle.isNotBlank() && imgAlt.contains(normalizedTitle)) {
+                score += 80
+            }
+            score
+        } ?: links.first()
+        return normalizeUrl(best.attr("href"), base)
+    }
+
+    private fun extractBestDescription(item: Element): String? = item.select(".description, .desc, p").firstOrNull()?.text()?.take(200)
+
+    private fun extractBestThumbnail(item: Element, base: String): String? {
+        val imageElement = item.select("img, source, video, [data-thumb], [data-thumbnail], [data-poster], [data-image], [style*='background-image']").firstOrNull()
+            ?: return null
+        return extractImageCandidate(imageElement, base)
+    }
+
+    private fun extractText(el: Element, sel: String): String =
+        runCatching { el.select(sel).text().replace(Regex("\\s+"), " ").trim() }.getOrDefault("")
+
+    private fun extractUrl(el: Element, sel: String, base: String): String {
+        val href = runCatching { el.select(sel).firstOrNull()?.attr("href") ?: "" }.getOrDefault("")
+        val resolved = href.ifBlank {
+            runCatching { el.selectFirst("a[href]")?.attr("href") ?: "" }.getOrDefault("")
+        }
+        return normalizeUrl(resolved, base)
+    }
+
+    private fun extractImageUrl(el: Element, sel: String, base: String): String {
+        val imageElement = el.select(sel).firstOrNull() ?: return ""
+        return extractImageCandidate(imageElement, base).orEmpty()
+    }
+
+    private fun extractImageCandidate(element: Element, base: String): String? {
+        val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
+            ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
+        val fromSrcset = srcset
+            ?.split(",")
+            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
+
+        val raw = listOf(
+            element.attr("src"),
+            element.attr("data-src"),
+            element.attr("data-lazy-src"),
+            element.attr("data-original"),
+            element.attr("data-lazy"),
+            element.attr("data-thumb"),
+            element.attr("data-thumbnail"),
+            element.attr("data-poster"),
+            element.attr("data-image"),
+            element.attr("poster"),
+            fromSrcset,
+            extractBackgroundImageUrl(element.attr("style"))
+        ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", ignoreCase = true) } ?: return null
+
+        return normalizeUrl(raw, base)
+    }
+
+    private fun extractBackgroundImageUrl(style: String): String? {
+        if (style.isBlank()) return null
+        return Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+            .find(style)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+
+    private fun extractTitleFromUrl(url: String): String? = runCatching {
+        val rawPath = URI(url).rawPath ?: ""
+        val path = rawPath.trimEnd('/')
+        if (path.isBlank()) return@runCatching null
+        val skipSegments = setOf(
+            "watch", "video", "videos", "movie", "movies", "detail", "details",
+            "view", "play", "embed", "download", "item", "result", "search",
+            "index", "home", "page", "channel", "category", "genre"
+        )
+        val extensionRegex = Regex("(?i)\\.(html?|php|aspx?)$")
+        val segment = path.split('/').asReversed().firstOrNull { seg ->
+            val candidate = URLDecoder.decode(seg, "UTF-8")
+                .replace(extensionRegex, "")
+                .trim()
+            candidate.isNotBlank() && candidate.lowercase() !in skipSegments
+        } ?: return@runCatching null
+        val title = URLDecoder.decode(segment, "UTF-8")
+            .replace(extensionRegex, "")
+            .replace(Regex("[-_]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (title.length >= 3 && title.any { it.isLetter() } &&
+            !SearchResultFilter.isLikelyCategory(title) &&
+            !SearchResultFilter.isLikelyDuration(title)
+        ) {
+            title.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        } else {
+            null
+        }
+    }.getOrNull()
+
+    private fun normalizeUrl(url: String, base: String): String = EngineUtils.normalizeUrl(url, base)
+
+    private fun extractDomain(url: String): String = EngineUtils.extractDomain(url)
+
+    private fun enforceRateLimit(id: String) {
+        val last = lastRequestTime[id] ?: 0L
+        val wait = DEFAULT_RATE_LIMIT_MS - (System.currentTimeMillis() - last)
+        if (wait > 0) Thread.sleep(wait)
+        lastRequestTime[id] = System.currentTimeMillis()
+    }
+
+    private fun updateProviderHealth(id: String, success: Boolean, time: Long) {
+        val h = providerHealthMap.getOrPut(id) { ProviderHealth() }
+        providerHealthMap[id] = if (success) h.copy(successCount = h.successCount + 1, avgResponseTime = (h.avgResponseTime + time) / 2)
+        else h.copy(failureCount = h.failureCount + 1)
+    }
+
+    data class ProviderHealth(val successCount: Int = 0, val failureCount: Int = 0, val avgResponseTime: Long = 0)
 }

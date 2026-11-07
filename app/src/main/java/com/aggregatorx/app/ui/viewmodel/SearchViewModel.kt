@@ -4,23 +4,24 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
-import com.aggregatorx.app.engine.media.AdvancedVideoExtractorEngine
-import com.aggregatorx.app.engine.media.DownloadManager
-import com.aggregatorx.app.engine.media.DownloadState
-import com.aggregatorx.app.engine.media.VideoExtractorEngine
-import com.aggregatorx.app.engine.media.VideoExtractionResult
-import com.aggregatorx.app.engine.media.VideoStreamResolver
+import com.aggregatorx.app.engine.media.*
+import com.aggregatorx.app.engine.ml.ProviderPaginationManager
+import com.aggregatorx.app.engine.ml.ResultNormalizer
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 
 /**
- * Lightweight result returned by video extraction so the UI can forward
- * both the playable URL **and** the HTTP headers that the CDN expects.
+ * Result returned by extraction to forward playable URL + HTTP headers.
  */
 data class VideoPreviewResult(
     val videoUrl: String,
@@ -48,537 +49,594 @@ class SearchViewModel @Inject constructor(
 
     val downloads: StateFlow<Map<String, DownloadState>> = downloadManager.downloads
 
-    // ── Liked-result state ──────────────────────────────────────────────
     private val _likedUrls = MutableStateFlow<Set<String>>(emptySet())
     val likedUrls: StateFlow<Set<String>> = _likedUrls.asStateFlow()
 
-    // ── MISSION CONTROL: Discovery pause flag ───────────────────────────
-    // When true, all Pass-1 and Pass-2 background coroutines are suspended.
-    // The results feed stays static and scrollable; no new data is injected.
-    private val _isDiscoveryPaused = MutableStateFlow(false)
-    val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
-
-    // ── Per-provider pagination state ───────────────────────────────────
-    private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
-    val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
-
-    // ── TOKENS tab: URLs discovered via token injection/replay ───────────
-    // Each entry is a SearchResult synthesised from a token-discovered URL.
     private val _tokenResults = MutableStateFlow<List<SearchResult>>(emptyList())
     val tokenResults: StateFlow<List<SearchResult>> = _tokenResults.asStateFlow()
 
-    // ── MY AI tab: preference-ranked results from liked history ──────────
-    // Populated after aggregation completes using the RankingEngine profile.
     private val _myAiResults = MutableStateFlow<List<SearchResult>>(emptyList())
     val myAiResults: StateFlow<List<SearchResult>> = _myAiResults.asStateFlow()
 
-    // Video URL cache
-    private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
+    private val _isDiscoveryPaused = MutableStateFlow(false)
+    val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
 
-    // Active search job — cancelled on new search or panic refresh
+    private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
+    private val _providerFetchPages = MutableStateFlow<Map<String, Int>>(emptyMap())
+    private val _loadingProviderIds = MutableStateFlow<Set<String>>(emptySet())
+    val loadingProviderIds: StateFlow<Set<String>> = _loadingProviderIds.asStateFlow()
+
+    private companion object {
+        const val PROVIDER_PAGE_SIZE = 50
+    }
+
+    // ── MISSION CONTROL: Session Tracking ───────────────────────────────
+    private val sessionSeenUrls = ConcurrentHashMap.newKeySet<String>()
+    private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
     private var currentSearchJob: Job? = null
+    private val autoFillJobs = ConcurrentHashMap<String, Job>()
+    private val autoFillSemaphore = Semaphore(2)
+
+    private fun rememberSeenUrls(urls: Iterable<String>) {
+        urls.filter { it.isNotBlank() }.forEach(sessionSeenUrls::add)
+    }
+
+    private fun forgetSeenUrls(urls: Iterable<String>) {
+        urls.filter { it.isNotBlank() }.forEach(sessionSeenUrls::remove)
+    }
 
     init {
+        ProviderPaginationManager.configure { providerId, query, state ->
+            val providerResult = repository.searchProviderPage(providerId, query, state.page - 1)
+            if (providerResult == null) {
+                emptyList()
+            } else {
+                ResultNormalizer.normalize(providerResult.provider.id, providerResult.provider.baseUrl, providerResult.results)
+            }
+        }
         viewModelScope.launch {
             repository.getRecentSearches().collect { searches ->
                 _uiState.update { it.copy(recentSearches = searches) }
             }
         }
         viewModelScope.launch {
-            _likedUrls.value = repository.getAllLikedUrls()
+            repository.getEnabledProviders().collect { providers ->
+                if (!_uiState.value.isSearching && !_uiState.value.searchCompleted) {
+                    _providerResults.value = providers.map { provider ->
+                        ProviderSearchResults(
+                            provider = provider,
+                            results = emptyList(),
+                            searchTime = 0L,
+                            success = false,
+                            errorMessage = "Ready to search",
+                            status = ProviderSearchStatus.READY
+                        )
+                    }
+                }
+            }
         }
+        viewModelScope.launch { _likedUrls.value = repository.getAllLikedUrls() }
     }
 
-    // ── PANIC REFRESH ───────────────────────────────────────────────────
-    // Clears ViewModel cache, requests GC, and hard-restarts the discovery
-    // loop for the current query. Fixes lag / thermal spikes on long shifts.
-    fun panicRefresh() {
+    // ── SEARCH & DISCOVERY ──────────────────────────────────────────────
+
+    fun search(isLoadMore: Boolean = false) {
+        val query = _uiState.value.query.trim()
+        if (query.isEmpty() || _isDiscoveryPaused.value) return
+
         currentSearchJob?.cancel()
-        videoPreviewCache.clear()
-        _providerResults.value = emptyList()
-        _providerPages.value = emptyMap()
-        _uiState.update {
-            it.copy(
-                isSearching = false,
-                searchCompleted = false,
-                totalResults = 0,
-                successfulProviders = 0,
-                failedProviders = 0,
-                aggregatedResults = null,
-                error = null
-            )
-        }
-        @Suppress("ExplicitGarbageCollectionCall")
-        System.gc()
-        // Re-launch discovery if a query is active
-        val query = _uiState.value.currentSearchQuery
-        if (query.isNotEmpty()) {
-            _uiState.update { it.copy(query = query) }
-            search()
-        }
-    }
 
-    // ── PAUSE / RESUME DISCOVERY ────────────────────────────────────────
-    // Toggles the pause flag. When paused, the active search job is
-    // cancelled so no new data is injected. Resuming re-launches the search.
-    fun toggleDiscoveryPause() {
-        val nowPaused = !_isDiscoveryPaused.value
-        _isDiscoveryPaused.value = nowPaused
-        if (nowPaused) {
-            // Suspend all background coroutines immediately
-            currentSearchJob?.cancel()
-            currentSearchJob = null
-            _uiState.update { it.copy(isSearching = false) }
-        } else {
-            // Resume — re-launch discovery from current query
-            val query = _uiState.value.currentSearchQuery
-            if (query.isNotEmpty()) {
-                _uiState.update { it.copy(query = query) }
-                search()
+        currentSearchJob = viewModelScope.launch {
+            if (!isLoadMore) {
+                autoFillJobs.values.forEach(Job::cancel)
+                autoFillJobs.clear()
+                sessionSeenUrls.clear()
+                repository.clearSearchCache()
+                videoPreviewCache.clear()
+                _providerResults.value = emptyList()
+                _tokenResults.value = emptyList()
+                _myAiResults.value = emptyList()
+                _providerPages.value = emptyMap()
+                _providerFetchPages.value = emptyMap()
+            }
+
+            _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
+            val currentResults = if (isLoadMore) {
+                _providerResults.value.toMutableList()
+            } else {
+                repository.getEnabledProvidersSnapshot().map { provider ->
+                    ProviderSearchResults(
+                        provider = provider,
+                        results = emptyList(),
+                        searchTime = 0L,
+                        success = false,
+                        errorMessage = null,
+                        status = ProviderSearchStatus.SEARCHING
+                    )
+                }.toMutableList()
+            }
+            _providerResults.value = currentResults.toList()
+            if (!isLoadMore) currentResults.forEach { ProviderPaginationManager.reset(it.provider.id) }
+            updateSearchStats(currentResults)
+
+            try {
+                // Calls Repository using the new pages parameter fix
+                repository.searchAllProviders(query, pages = _providerFetchPages.value)
+                    .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
+                    .collect { providerResult ->
+                        try {
+                            val normalizedResults = safeNormalize(providerResult)
+                            ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
+                            val terminalStatus = when {
+                                normalizedResults.isNotEmpty() -> ProviderSearchStatus.RESULTS
+                                providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
+                                providerResult.success -> ProviderSearchStatus.EMPTY
+                                else -> ProviderSearchStatus.FAILED
+                            }
+                            val normalizedProviderResult = providerResult.copy(
+                                results = normalizedResults,
+                                totalResults = normalizedResults.size,
+                                hasMore = providerResult.hasMore,
+                                success = normalizedResults.isNotEmpty(),
+                                errorMessage = providerResult.errorMessage
+                                    ?: if (normalizedResults.isEmpty()) "No parseable results found" else null,
+                                status = terminalStatus
+                            )
+                            rememberSeenUrls(normalizedResults.map { it.url })
+                            upsertProviderResult(currentResults, normalizedProviderResult)
+                            _providerResults.value = currentResults.toList()
+                            updateSearchStats(currentResults)
+                            if (terminalStatus == ProviderSearchStatus.RESULTS && normalizedResults.size < PROVIDER_PAGE_SIZE) {
+                                scheduleAutoFill(providerResult.provider.id, query)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            val failed = providerResult.copy(
+                                results = emptyList(),
+                                success = false,
+                                errorMessage = e.message ?: e.javaClass.simpleName,
+                                status = ProviderSearchStatus.FAILED
+                            )
+                            upsertProviderResult(currentResults, failed)
+                            _providerResults.value = currentResults.toList()
+                            updateSearchStats(currentResults)
+                        }
+                    }
+                currentResults.replaceAll { result ->
+                    if (result.status == ProviderSearchStatus.SEARCHING) {
+                        result.copy(
+                            success = false,
+                            errorMessage = "Search ended before this provider responded",
+                            status = ProviderSearchStatus.FAILED
+                        )
+                    } else result
+                }
+                _providerResults.value = currentResults.toList()
+                finalizeAggregatedState(query, currentResults)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(error = e.message ?: "Search failed") }
+            } finally {
+                _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
+            }
+
+            // PASS 2: Preference Ranking (AI Tab)
+            launch {
+                val likedDomains = _likedUrls.value.mapNotNull { 
+                    try { java.net.URI(it).host } catch (_: Exception) { null } 
+                }.toSet()
+
+                val aiRanked = currentResults.flatMap { it.results }
+                    .map { r ->
+                        val host = try { java.net.URI(r.url).host } catch (_: Exception) { "" }
+                        val boost = if (host in likedDomains) 50f else 0f
+                        r.copy(relevanceScore = r.relevanceScore + boost)
+                    }
+                    .filter { it.relevanceScore > 40f }
+                    .sortedByDescending { it.relevanceScore }
+                _myAiResults.value = aiRanked.take(50)
+            }
+
+            // PASS 3: Related discovery (Token Tab)
+            launch {
+                val tokensFound = mutableListOf<SearchResult>()
+                currentResults.filter { it.success }.forEach { p ->
+                    try {
+                        tokenManager.replayTokensForSearch(p.provider.baseUrl, query).forEach { url ->
+                            if (!sessionSeenUrls.contains(url)) {
+                                tokensFound.add(SearchResult(
+                                    providerId = p.provider.id,
+                                    providerName = "${p.provider.name} [TOKEN]",
+                                    title = "Discovered: ${url.takeLast(30)}",
+                                    url = url,
+                                    relevanceScore = 60f
+                                ))
+                                rememberSeenUrls(listOf(url))
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+                _tokenResults.value = tokensFound.distinctBy { it.url }
             }
         }
     }
 
-    // ── Per-provider pagination ─────────────────────────────────────────
+    // ── PAGINATION & CONTROLS ──────────────────────────────────────────
+
     fun nextProviderPage(providerId: String) {
-        _providerPages.update { pages ->
-            val current = pages[providerId] ?: 0
-            pages + (providerId to current + 1)
+        val current = _providerPages.value[providerId] ?: 0
+        val loadedCount = _providerResults.value
+            .firstOrNull { it.provider.id == providerId }
+            ?.results
+            ?.size ?: 0
+
+        if (loadedCount > (current + 1) * PROVIDER_PAGE_SIZE) {
+            _providerPages.update { it + (providerId to current + 1) }
+        } else {
+            val query = _uiState.value.currentSearchQuery.ifBlank { _uiState.value.query }.trim()
+            if (query.isBlank()) return
+            viewModelScope.launch {
+                _loadingProviderIds.update { it + providerId }
+                try {
+                    ProviderPaginationManager.fetchMoreResults(providerId, query).collect { fetched ->
+                        val existingIndex = _providerResults.value.indexOfFirst { it.provider.id == providerId }
+                        if (existingIndex >= 0 && fetched.isNotEmpty()) {
+                            val next = _providerResults.value.toMutableList()
+                            val existing = next[existingIndex]
+                            val unique = fetched.filter { sessionSeenUrls.add(it.url) }
+                            next[existingIndex] = existing.copy(
+                                results = (existing.results + unique).distinctBy { it.url },
+                                totalResults = existing.results.size + unique.size,
+                                hasMore = unique.isNotEmpty()
+                            )
+                            _providerResults.value = next
+                        } else if (existingIndex >= 0) {
+                            val next = _providerResults.value.toMutableList()
+                            next[existingIndex] = next[existingIndex].copy(hasMore = false)
+                            _providerResults.value = next
+                        }
+                    }
+                    _providerPages.update { it + (providerId to current + 1) }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    _uiState.update { it.copy(error = "Load more failed: ${e.message ?: e.javaClass.simpleName}") }
+                } finally {
+                    _loadingProviderIds.update { it - providerId }
+                }
+            }
         }
     }
 
     fun prevProviderPage(providerId: String) {
         _providerPages.update { pages ->
             val current = pages[providerId] ?: 0
-            if (current > 0) pages + (providerId to current - 1) else pages
+            if (current <= 0) pages - providerId else pages + (providerId to current - 1)
         }
     }
 
     fun refreshProvider(providerId: String) {
-        _providerPages.update { pages -> pages + (providerId to 0) }
-    }
-
-    /** Toggle like on a search result. Updates local set immediately for snappy UI. */
-    fun toggleLike(result: SearchResult) {
+        ProviderPaginationManager.reset(providerId)
+        val query = _uiState.value.currentSearchQuery.ifBlank { _uiState.value.query }.trim()
+        _providerPages.update { it - providerId }
+        _providerFetchPages.update { it - providerId }
+        val removedUrls = _providerResults.value
+            .firstOrNull { it.provider.id == providerId }
+            ?.results
+            ?.map { it.url }
+            .orEmpty()
+        forgetSeenUrls(removedUrls)
+        if (query.isBlank()) return
         viewModelScope.launch {
-            val nowLiked = repository.toggleLike(result)
-            _likedUrls.update { urls ->
-                if (nowLiked) urls + result.url else urls - result.url
-            }
-        }
-    }
-    
-    fun updateQuery(query: String) {
-        _uiState.update { it.copy(query = query) }
-    }
-    
-    fun search() {
-        val query = _uiState.value.query.trim()
-        if (query.isEmpty()) return
-        if (_isDiscoveryPaused.value) return
-
-        // Cancel any in-flight search immediately
-        currentSearchJob?.cancel()
-
-        currentSearchJob = viewModelScope.launch {
-            // ── Full fresh scrape: wipe every cache and prior result ──────
-            repository.clearSearchCache()
-            videoPreviewCache.clear()
-            _providerPages.value  = emptyMap()
-            _providerResults.value = emptyList()
-            _tokenResults.value    = emptyList()
-            _myAiResults.value     = emptyList()
-
-            _uiState.update {
-                it.copy(
-                    isSearching         = true,
-                    searchCompleted     = false,
-                    currentSearchQuery  = query,
-                    totalResults        = 0,
-                    successfulProviders = 0,
-                    failedProviders     = 0,
-                    aggregatedResults   = null,
-                    error               = null
-                )
-            }
-            
-            val results = mutableListOf<ProviderSearchResults>()
-            
-            repository.searchAllProviders(query)
-                .catch { e ->
-                    // Only set error if we have NO results at all — otherwise partial results are fine
-                    if (results.isEmpty()) {
-                        _uiState.update { 
-                            it.copy(error = e.message ?: "Search failed") 
-                        }
+            _loadingProviderIds.update { it + providerId }
+            try {
+                repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
+                    val normalized = safeNormalize(providerResult)
+                    ProviderPaginationManager.markFetched(providerId, normalized.size)
+                    val status = when {
+                        normalized.isNotEmpty() -> ProviderSearchStatus.RESULTS
+                        providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
+                        providerResult.success -> ProviderSearchStatus.EMPTY
+                        else -> ProviderSearchStatus.FAILED
                     }
+                    _providerResults.update { current ->
+                        current.filterNot { it.provider.id == providerId } + providerResult.copy(
+                            results = normalized,
+                            totalResults = normalized.size,
+                            hasMore = providerResult.hasMore,
+                            success = normalized.isNotEmpty(),
+                            status = status,
+                            errorMessage = providerResult.errorMessage
+                                ?: if (normalized.isEmpty()) "No parseable results found" else null
+                        )
+                    }
+                    rememberSeenUrls(normalized.map { it.url })
+                    updateSearchStats(_providerResults.value)
                 }
-                .collect { providerResult ->
-                    results.add(providerResult)
-                    _providerResults.value = results.toList()
-                    
-                    // Update aggregated results — wrap in try-catch so aggregation
-                    // failure never kills the collection loop
-                    try {
-                        val aggregated = repository.aggregateSearchResults(query, results)
-                        _uiState.update { 
-                            it.copy(
-                                aggregatedResults = aggregated,
-                                totalResults = aggregated.totalResults,
-                                successfulProviders = aggregated.successfulProviders,
-                                failedProviders = aggregated.failedProviders,
-                                error = null // clear any previous error since we got results
-                            ) 
-                        }
-                    } catch (e: Exception) {
-                        // Aggregation failed — still show raw provider results
-                        _uiState.update {
-                            it.copy(
-                                totalResults = results.sumOf { r -> r.results.size },
-                                successfulProviders = results.count { r -> r.success },
-                                failedProviders = results.count { r -> !r.success }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _providerResults.update { current ->
+                    current.map { providerResult ->
+                        if (providerResult.provider.id == providerId) {
+                            providerResult.copy(
+                                results = emptyList(),
+                                success = false,
+                                errorMessage = e.message ?: e.javaClass.simpleName,
+                                status = ProviderSearchStatus.FAILED
                             )
-                        }
+                        } else providerResult
                     }
                 }
-            
-            _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
-
-            // ── Post-search: token discovery pass ────────────────────────
-            // Run token harvesting against each active provider in background.
-            // Results surface in the TOKENS quick-tab.
-            launch {
-                val tokenFound = mutableListOf<SearchResult>()
-                results.filter { it.success }.forEach { providerResult ->
-                    try {
-                        val providerUrl = providerResult.provider.baseUrl
-                        val discovered = tokenManager.replayTokensForSearch(providerUrl, query)
-                        discovered.take(20).forEach { url ->
-                            tokenFound.add(
-                                SearchResult(
-                                    providerId    = providerResult.provider.id.toString(),
-                                    providerName  = providerResult.provider.name + " [TOKEN]",
-                                    title         = "Token-discovered: ${url.take(80)}",
-                                    url           = url,
-                                    relevanceScore = 75f
-                                )
-                            )
-                        }
-                    } catch (_: Exception) {}
-                }
-                if (tokenFound.isNotEmpty()) {
-                    _tokenResults.value = tokenFound.distinctBy { it.url }
-                }
-            }
-
-            // ── Post-search: MY AI preference ranking ────────────────────
-            // Score all results against the liked-URL preference profile and
-            // surface the top matches in the MY AI quick-tab.
-            launch {
-                val likedSet = _likedUrls.value
-                if (likedSet.isEmpty()) return@launch
-                val allResults = results.flatMap { it.results }
-                // Boost results whose source domain matches liked domains
-                val likedDomains = likedSet.mapNotNull { url ->
-                    try { java.net.URI(url).host } catch (_: Exception) { null }
-                }.toSet()
-                val aiRanked = allResults
-                    .map { r ->
-                        val domain = try { java.net.URI(r.url).host } catch (_: Exception) { "" }
-                        val boost  = if (domain in likedDomains) 30f else 0f
-                        r.copy(relevanceScore = r.relevanceScore + boost)
-                    }
-                    .sortedByDescending { it.relevanceScore }
-                    .take(50)
-                _myAiResults.value = aiRanked
+                _uiState.update { it.copy(error = "Provider refresh failed: ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                _loadingProviderIds.update { it - providerId }
             }
         }
     }
-    
-    fun clearSearch() {
-        _uiState.update { 
-            it.copy(
-                query = "",
-                aggregatedResults = null,
-                searchCompleted = false,
-                error = null
-            ) 
+
+    private suspend fun safeNormalize(providerResult: ProviderSearchResults): List<SearchResult> {
+        val base = providerResult.results.filter { it.url.isNotBlank() && it.title.isNotBlank() }
+        return runCatching {
+            ResultNormalizer.normalize(
+                providerId = providerResult.provider.id,
+                providerBaseUrl = providerResult.provider.baseUrl,
+                results = base
+            )
+        }.getOrElse {
+            base.distinctBy { result -> result.url }.take(PROVIDER_PAGE_SIZE)
         }
-        _providerResults.value = emptyList()
-        // Clear video URL cache when search is cleared
-        videoPreviewCache.clear()
     }
-    
-    fun clearError() {
-        _uiState.update { it.copy(error = null) }
+
+    private fun updateSearchStats(currentResults: List<ProviderSearchResults>) {
+        _uiState.update { state ->
+            state.copy(
+                totalResults = sessionSeenUrls.size,
+                successfulProviders = currentResults.count { it.status == ProviderSearchStatus.RESULTS },
+                failedProviders = currentResults.count {
+                    it.status == ProviderSearchStatus.FAILED || it.status == ProviderSearchStatus.TIMED_OUT
+                }
+            )
+        }
     }
-    
+
+    private fun upsertProviderResult(
+        currentResults: MutableList<ProviderSearchResults>,
+        providerResult: ProviderSearchResults
+    ) {
+        val existingIndex = currentResults.indexOfFirst { it.provider.id == providerResult.provider.id }
+        if (existingIndex >= 0) currentResults[existingIndex] = providerResult else currentResults.add(providerResult)
+    }
+
+    private fun scheduleAutoFill(providerId: String, query: String) {
+        if (autoFillJobs[providerId]?.isActive == true) return
+        val job = viewModelScope.launch {
+            autoFillSemaphore.withPermit {
+                _loadingProviderIds.update { it + providerId }
+                try {
+                    repeat(2) {
+                        val currentProvider = _providerResults.value.firstOrNull { it.provider.id == providerId }
+                            ?: return@repeat
+                        if (currentProvider.results.size >= PROVIDER_PAGE_SIZE || !currentProvider.hasMore) return@repeat
+
+                        val fetched = ProviderPaginationManager.fetchMoreResults(providerId, query).first()
+                        val unique = fetched.filter { newResult ->
+                            currentProvider.results.none { it.url == newResult.url }
+                        }
+                        if (unique.isEmpty()) {
+                            _providerResults.update { current ->
+                                current.map { result ->
+                                    if (result.provider.id == providerId) result.copy(hasMore = false) else result
+                                }
+                            }
+                            return@repeat
+                        }
+                        rememberSeenUrls(unique.map { it.url })
+                        _providerResults.update { current ->
+                            current.map { result ->
+                                if (result.provider.id == providerId) {
+                                    val combined = (result.results + unique).distinctBy { it.url }
+                                    result.copy(
+                                        results = combined,
+                                        totalResults = combined.size,
+                                        success = true,
+                                        status = ProviderSearchStatus.RESULTS,
+                                        hasMore = unique.isNotEmpty()
+                                    )
+                                } else result
+                            }
+                        }
+                        updateSearchStats(_providerResults.value)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Throwable) {
+                    // Initial results stay visible if background pagination fails.
+                } finally {
+                    _loadingProviderIds.update { it - providerId }
+                }
+            }
+        }
+        autoFillJobs[providerId] = job
+        job.invokeOnCompletion { autoFillJobs.remove(providerId, job) }
+    }
+
+    private suspend fun finalizeAggregatedState(query: String, currentResults: List<ProviderSearchResults>) {
+        runCatching {
+            val aggregated = repository.aggregateSearchResults(query, currentResults)
+            _uiState.update { it.copy(
+                aggregatedResults = aggregated,
+                totalResults = sessionSeenUrls.size,
+                successfulProviders = currentResults.count { result -> result.status == ProviderSearchStatus.RESULTS },
+                failedProviders = currentResults.count { result ->
+                    result.status == ProviderSearchStatus.FAILED || result.status == ProviderSearchStatus.TIMED_OUT
+                }
+            ) }
+        }
+    }
+
+    fun searchFromHistory(query: String) {
+        updateQuery(query)
+        search(isLoadMore = false)
+    }
+
     fun clearSearchHistory() {
         viewModelScope.launch {
             repository.clearSearchHistory()
         }
     }
-    
-    fun searchFromHistory(query: String) {
-        // Set query then trigger a full fresh search
-        _uiState.update { it.copy(query = query) }
-        search()
+
+    fun panicRefresh() {
+        currentSearchJob?.cancel()
+        search(isLoadMore = false)
+        @Suppress("ExplicitGarbageCollectionCall")
+        System.gc()
+    }
+
+    fun toggleDiscoveryPause() {
+        val nowPaused = !_isDiscoveryPaused.value
+        _isDiscoveryPaused.value = nowPaused
+        if (nowPaused) {
+            currentSearchJob?.cancel()
+            _uiState.update { it.copy(isSearching = false) }
+        } else {
+            search(isLoadMore = true)
+        }
+    }
+
+    fun toggleLike(result: SearchResult) {
+        viewModelScope.launch {
+            val nowLiked = repository.toggleLike(result)
+            _likedUrls.update { urls -> if (nowLiked) urls + result.url else urls - result.url }
+        }
+    }
+
+    fun updateQuery(query: String) { _uiState.update { it.copy(query = query) } }
+
+    fun clearError() {
+        _uiState.update { it.copy(error = null) }
     }
     
-    /**
-     * Extract video URL from a page URL using the FULL resolution chain:
-     *   1) Cache hit
-     *   2) VideoExtractorEngine fast (JSoup, no browser)
-     *   3) VideoExtractorEngine full (known host extractors + iframe + headless)
-     *   4) VideoStreamResolver (direct → proxy → headless → site-specific extractors)
-     *   5) Direct URL probe: if pageUrl itself looks playable, try it directly
-     *   6) Fallback: return the page URL itself for embeddable sites
-     *   7) Last resort: pass the raw URL to the player (never returns null)
-     *
-     * Returns [VideoPreviewResult] with a playable URL and HTTP headers,
-     * or **null** if no playable stream could be found.  Null is explicitly
-     * preferable to returning an HTML page URL — the caller should show
-     * an error dialog instead of feeding HTML to ExoPlayer.
-     */
-    suspend fun extractVideoForPreview(pageUrl: String): VideoPreviewResult? {
-        // 1. Cache hit — only return if the cached URL still looks valid
-        videoPreviewCache[pageUrl]?.let { cached ->
-            if (isLikelyMediaUrl(cached.videoUrl)) return cached
-            else videoPreviewCache.remove(pageUrl)  // purge stale/bad cache entries
+    fun clearSearch() {
+        _uiState.update { it.copy(query = "", aggregatedResults = null, searchCompleted = false, error = null) }
+        _providerResults.update { current ->
+            current.map { result ->
+                result.copy(
+                    results = emptyList(),
+                    searchTime = 0L,
+                    success = false,
+                    errorMessage = "Ready to search",
+                    totalResults = 0,
+                    hasMore = false,
+                    status = ProviderSearchStatus.READY
+                )
+            }
         }
+        sessionSeenUrls.clear()
+        videoPreviewCache.clear()
+    }
+
+    // ── VIDEO EXTRACTION CHAIN ──────────────────────────────────────────
+
+    suspend fun extractVideoForPreview(pageUrl: String): VideoPreviewResult? {
+        videoPreviewCache[pageUrl]?.let { if (isLikelyMediaUrl(it.videoUrl)) return it }
 
         return try {
-            // 2. AdvancedVideoExtractorEngine — primary (50+ site-specific + generic)
-            val advResult = advancedExtractor.extract(pageUrl)
-            if (advResult.success && !advResult.videoUrl.isNullOrEmpty() && isLikelyMediaUrl(advResult.videoUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = advResult.videoUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+            val adv = advancedExtractor.extract(pageUrl)
+            if (adv.success && !adv.videoUrl.isNullOrEmpty() && isLikelyMediaUrl(adv.videoUrl)) {
+                return cacheAndReturn(pageUrl, adv.videoUrl)
             }
 
-            // 3. Fast extraction (JSoup only – no headless browser)
-            val fastUrl = videoExtractor.extractVideoUrlForPreview(pageUrl)
-            if (!fastUrl.isNullOrEmpty() && isLikelyMediaUrl(fastUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = fastUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+            val fast = videoExtractor.extractVideoUrlForPreview(pageUrl)
+            if (!fast.isNullOrEmpty() && isLikelyMediaUrl(fast)) {
+                return cacheAndReturn(pageUrl, fast)
             }
 
-            // 4. Full extraction (known host extractors + standard HTML + headless)
-            val fullExtraction = videoExtractor.extractVideoUrl(pageUrl)
-            if (fullExtraction.success && !fullExtraction.videoUrl.isNullOrEmpty()
-                && isLikelyMediaUrl(fullExtraction.videoUrl)
-            ) {
-                val result = VideoPreviewResult(
-                    videoUrl = fullExtraction.videoUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
-            }
-
-            // 5. Full resolution chain (proxy → headless → site-specific)
             val resolved = videoStreamResolver.resolveVideoStream(pageUrl)
-            if (resolved.success && !resolved.streamUrl.isNullOrEmpty()
-                && isLikelyMediaUrl(resolved.streamUrl)
-            ) {
-                val result = VideoPreviewResult(
-                    videoUrl = resolved.streamUrl,
-                    headers = resolved.headers ?: buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+            if (resolved.success && !resolved.streamUrl.isNullOrEmpty() && isLikelyMediaUrl(resolved.streamUrl)) {
+                val res = VideoPreviewResult(resolved.streamUrl, resolved.headers ?: buildPlaybackHeaders(pageUrl))
+                videoPreviewCache[pageUrl] = res
+                return res
             }
 
-            // 5. Direct URL probe – if the page URL itself is a direct media link
-            if (isLikelyMediaUrl(pageUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
-            }
-
-            // 6. (removed) — Embeddable sites (YouTube, Vimeo, etc.) cannot be
-            //    played directly in ExoPlayer.  They would need yt-dlp or similar
-            //    which we don't bundle.  Don't pretend these are playable.
-
-            // 7. Last resort — only return the raw URL if it actually looks like
-            //    a media stream (e.g. direct .mp4 link from a CDN).
-            //    If the URL is just an HTML page, return null so the caller
-            //    can show a proper error instead of feeding HTML to ExoPlayer.
-            if (isLikelyMediaUrl(pageUrl)) {
-                val fallback = VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = fallback
-                return fallback
-            }
-
-            // Extraction failed — no playable stream found
-            return null
-        } catch (e: Exception) {
-            // On exception, only return raw URL if it looks like actual media
-            return if (isLikelyMediaUrl(pageUrl)) {
-                VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-            } else {
-                null
-            }
-        }
+            if (isLikelyMediaUrl(pageUrl)) cacheAndReturn(pageUrl, pageUrl) else null
+        } catch (e: Exception) { if (isLikelyMediaUrl(pageUrl)) cacheAndReturn(pageUrl, pageUrl) else null }
     }
 
-    /**
-     * Checks whether a URL plausibly points to a media stream rather than an HTML page.
-     * Used as a safety gate to avoid handing HTML pages to ExoPlayer.
-     */
+    private fun cacheAndReturn(pageUrl: String, videoUrl: String): VideoPreviewResult {
+        val res = VideoPreviewResult(videoUrl, buildPlaybackHeaders(pageUrl))
+        videoPreviewCache[pageUrl] = res
+        return res
+    }
+
     private fun isLikelyMediaUrl(url: String): Boolean {
-        val lowerUrl = url.lowercase()
-        val videoIndicators = listOf(
-            ".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".avi", ".mov",
-            ".flv", ".wmv", ".ts", ".m4v", ".3gp", ".f4v", ".ogv",
-            "/hls/", "/dash/", "/video/", "/stream/", "videoplayback",
-            "/get_video", "/dl/", "/media/", "/embed/",
-            "googlevideo.com", "akamaized.net", "cdn.streamtape",
-            "dood.", "filemoon.", "streamwish.", "mixdrop.", "voe.sx"
-        )
-        return videoIndicators.any { lowerUrl.contains(it) }
+        val lower = url.lowercase()
+        return listOf(".mp4", ".m3u8", ".mpd", ".webm", "videoplayback", "akamaized", "cdn").any { lower.contains(it) }
     }
 
-    /** Convenience wrapper that keeps the old String?-returning signature for callers that don't need headers. */
-    suspend fun extractVideoUrlForPreview(pageUrl: String): String? {
-        return extractVideoForPreview(pageUrl)?.videoUrl
-    }
-
-    /** Build standard playback headers from the originating page URL. */
     private fun buildPlaybackHeaders(pageUrl: String): Map<String, String> {
         val origin = try {
             val uri = android.net.Uri.parse(pageUrl)
             "${uri.scheme}://${uri.host}"
         } catch (_: Exception) { pageUrl }
-        return mapOf(
-            "User-Agent" to EngineUtils.DEFAULT_USER_AGENT,
-            "Referer" to "$origin/",
-            "Origin" to origin,
-            "Accept" to "*/*"
-        )
+        return mapOf("User-Agent" to EngineUtils.DEFAULT_USER_AGENT, "Referer" to "$origin/", "Origin" to origin)
     }
-    
-    /**
-     * Extract video URL from a search result page — Watch button handler.
-     *
-     * Resolution order:
-     *   1. AdvancedVideoExtractorEngine (50+ site-specific + generic)
-     *   2. VideoExtractorEngine (legacy fast path)
-     *   3. VideoStreamResolver (proxy → headless → site-specific chain)
-     */
+
     fun extractVideoUrl(result: SearchResult) {
         viewModelScope.launch {
             _videoExtractionState.value = VideoExtractionState.Extracting(result.title)
             try {
-                // Step 1: AdvancedVideoExtractorEngine
-                val advResult = advancedExtractor.extract(result.url)
-                if (advResult.success && !advResult.videoUrl.isNullOrEmpty()) {
+                val resolved = withTimeoutOrNull(35_000L) { extractVideoForPreview(result.url) }
+                if (resolved != null && isLikelyMediaUrl(resolved.videoUrl)) {
                     _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = advResult.videoUrl,
+                        videoUrl = resolved.videoUrl,
                         title = result.title,
-                        quality = advResult.quality,
-                        isStream = advResult.isStream,
-                        headers = buildPlaybackHeaders(result.url)
+                        quality = result.quality,
+                        isStream = resolved.videoUrl.contains(".m3u8", true) || resolved.videoUrl.contains(".mpd", true),
+                        headers = resolved.headers.ifEmpty { buildPlaybackHeaders(result.url) }
                     )
                     return@launch
                 }
-
-                // Step 2: Legacy VideoExtractorEngine
-                val legacyResult = videoExtractor.extractVideoUrl(result.url)
-                if (legacyResult.success && !legacyResult.videoUrl.isNullOrEmpty()) {
-                    _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = legacyResult.videoUrl,
-                        title = result.title,
-                        quality = legacyResult.quality,
-                        isStream = legacyResult.format in listOf("m3u8", "mpd", "hls"),
-                        headers = buildPlaybackHeaders(result.url)
-                    )
-                    return@launch
-                }
-
-                // Step 3: Full resolution chain
-                val resolved = videoStreamResolver.resolveVideoStream(result.url)
-                if (resolved.success && !resolved.streamUrl.isNullOrEmpty()) {
-                    _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = resolved.streamUrl,
-                        title = result.title,
-                        quality = resolved.quality,
-                        isStream = resolved.streamType.name in listOf("HLS", "DASH"),
-                        headers = resolved.headers ?: buildPlaybackHeaders(result.url)
-                    )
-                    return@launch
-                }
-
                 _videoExtractionState.value = VideoExtractionState.Error(
-                    "Could not extract a playable stream from this URL. Try opening in browser."
+                    "No direct playable stream was found. Open this result In App instead."
                 )
             } catch (e: Exception) {
-                _videoExtractionState.value = VideoExtractionState.Error(
-                    e.message ?: "Video extraction failed"
-                )
+                _videoExtractionState.value = VideoExtractionState.Error(e.message ?: "Video extraction failed")
             }
         }
     }
-    
-    /**
-     * Reset video extraction state
-     */
-    fun resetVideoState() {
-        _videoExtractionState.value = VideoExtractionState.Idle
-    }
-    
-    /**
-     * Start download for a search result
-     */
+
+    // ── DOWNLOADS ───────────────────────────────────────────────────────
+
     fun downloadResult(result: SearchResult) {
         viewModelScope.launch {
             try {
-                downloadManager.downloadFromPage(result.url, result.title)
-            } catch (e: Exception) {
-                _uiState.update { 
-                    it.copy(error = "Download failed: ${e.message}") 
+                val resolved = withTimeoutOrNull(35_000L) { extractVideoForPreview(result.url) }
+                if (resolved != null && isLikelyMediaUrl(resolved.videoUrl)) {
+                    downloadManager.downloadDirect(resolved.videoUrl, result.title, resolved.headers, result.url)
+                } else {
+                    _uiState.update {
+                        it.copy(error = "Download unavailable: this page did not expose a downloadable media stream")
+                    }
                 }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = "Download failed: ${e.message ?: e.javaClass.simpleName}") }
             }
         }
     }
-    
-    /**
-     * Download from extracted video URL directly
-     */
+
     fun downloadVideoUrl(videoUrl: String, title: String) {
         viewModelScope.launch {
-            try {
-                downloadManager.downloadDirect(videoUrl, title)
-            } catch (e: Exception) {
-                _uiState.update { 
-                    it.copy(error = "Download failed: ${e.message}") 
-                }
-            }
+            try { downloadManager.downloadDirect(videoUrl, title) } 
+            catch (e: Exception) { _uiState.update { it.copy(error = "Download failed: ${e.message}") } }
         }
     }
-    
-    /**
-     * Cancel a download
-     */
-    fun cancelDownload(downloadId: String) {
-        downloadManager.cancelDownload(downloadId)
-    }
+
+    fun cancelDownload(id: String) = downloadManager.cancelDownload(id)
+    fun resetVideoState() { _videoExtractionState.value = VideoExtractionState.Idle }
 }
 
 data class SearchUiState(
@@ -594,17 +652,12 @@ data class SearchUiState(
     val error: String? = null
 )
 
-/**
- * State for video extraction process
- */
 sealed class VideoExtractionState {
     object Idle : VideoExtractionState()
     data class Extracting(val title: String) : VideoExtractionState()
     data class Success(
-        val videoUrl: String,
-        val title: String,
-        val quality: String?,
-        val isStream: Boolean,
+        val videoUrl: String, val title: String, 
+        val quality: String?, val isStream: Boolean, 
         val headers: Map<String, String> = emptyMap()
     ) : VideoExtractionState()
     data class Error(val message: String) : VideoExtractionState()

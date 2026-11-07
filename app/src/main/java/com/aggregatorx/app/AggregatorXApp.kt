@@ -7,7 +7,11 @@ import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.util.EngineUtils
+import com.aggregatorx.app.data.memory.ProviderMemoryStore
+import com.aggregatorx.app.engine.ml.AnalysisHelper
+import com.aggregatorx.app.engine.ml.ProviderPaginationManager
 import dagger.hilt.android.HiltAndroidApp
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
@@ -23,6 +27,10 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        HeadlessBrowserHelper.configure(this)
+        ProviderMemoryStore.init(this)
+        ProviderPaginationManager.init()
+        AnalysisHelper.init()
     }
 
     /**

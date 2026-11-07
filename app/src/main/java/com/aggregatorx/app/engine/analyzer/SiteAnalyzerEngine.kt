@@ -1,17 +1,27 @@
 package com.aggregatorx.app.engine.analyzer
 
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+import com.aggregatorx.app.engine.token.TokenManager
+import com.aggregatorx.app.engine.vision.VisionEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
+import java.net.InetAddress
 import java.net.URL
 import java.security.cert.X509Certificate
 import javax.inject.Inject
 import javax.inject.Singleton
 import javax.net.ssl.HttpsURLConnection
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -29,7 +39,12 @@ import kotlinx.serialization.json.Json
  * - Results cached per URL to avoid redundant network calls
  */
 @Singleton
-class SiteAnalyzerEngine @Inject constructor() {
+class SiteAnalyzerEngine @Inject constructor(
+    private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
+    private val tokenManager: TokenManager,
+    private val visionEngine: VisionEngine,
+    private val tlsFingerprintEngine: TlsFingerprintEngine
+) {
 
     /** Cache: url → (SiteAnalysis, timestamp) */
     private val analysisCache = mutableMapOf<String, Pair<SiteAnalysis, Long>>()
@@ -41,7 +56,10 @@ class SiteAnalyzerEngine @Inject constructor() {
     
     companion object {
         private const val DEFAULT_TIMEOUT = 30000
+        private const val RENDER_TIMEOUT_MS = 18_000L
+        private const val CAPABILITY_STEP_TIMEOUT_MS = 6_000L
         private const val ANALYSIS_CACHE_TTL_MS = 3_600_000L // 1 hour
+        const val CAPABILITY_REPORT_HEADER = "AggregatorX-Capability-Report"
         private val DEFAULT_USER_AGENT = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT
         
         // Common selectors for pattern detection
@@ -104,6 +122,115 @@ class SiteAnalyzerEngine @Inject constructor() {
             "Upgrade-Insecure-Requests" to "1",
             "Cache-Control" to "no-cache"
         )
+
+        // Pre-compiled patterns / constant selector lists. These were previously
+        // rebuilt on every call of the functions below; Regex instances and lists
+        // are immutable and only ever read, so sharing one instance is equivalent.
+        private val REST_API_PATTERNS = listOf(
+            Regex("""(?:fetch|axios\.get|axios\.post|http\.get|http\.post)\s*\(\s*['"`](\/api\/[^'"`\s\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""(?:\$\.ajax|XMLHttpRequest)[^'"]*url['":\s]+['"`](\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""url\s*:\s*['"`](\/api\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""['"`](\/api\/v\d+\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/rest\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/wp-json\/[^'"`\s]+)['"`]"""),  // WordPress REST
+            Regex("""['"`](\/ghost\/api\/[^'"`\s]+)['"`]"""),  // Ghost CMS
+            Regex("""['"`](\/admin\/api\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/content\/api\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/cms\/api\/[^'"`\s]+)['"`]""")
+        )
+        private val GRAPHQL_ENDPOINT_PATTERNS = listOf(
+            Regex("""['"`](\/graphql[^'"`\s]*)['"`]"""),
+            Regex("""['"](https?:\/\/[^'"`\s]+\/graphql[^'"`\s]*)['"]""")
+        )
+        private val GRAPHQL_URI_PATTERN = Regex("""uri\s*:\s*['"`]([^'"`\s]+)['"`]""")
+        private val WEBSOCKET_PATTERN = Regex("""new WebSocket\s*\(\s*['"`](wss?:\/\/[^'"`\s]+)['"`]""")
+        private val STRAPI_API_PATTERN = Regex("""['"`](\/api\/[a-z-]+(?:\?[^'"`\s]*)?)['"`]""")
+        private val DIRECTUS_API_PATTERN = Regex("""['"`](\/items\/[^'"`\s]+)['"`]""")
+        private val JSON_ENDPOINT_PATTERNS = listOf(
+            Regex("""['"`](https?:\/\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
+            Regex("""['"`](\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
+            Regex("""data-src=['"`](https?:\/\/[^'"`\s]+)['"`]""")
+        )
+        private val DATA_ENDPOINT_ATTRIBUTES = listOf("data-api", "data-url", "data-endpoint", "data-src-url", "data-ajax-url")
+        private val GRAPHQL_INDICATORS = listOf("graphql", "gql`", " query {", " mutation {", " subscription {", "ApolloClient", "urql")
+
+        private val JS_REQUIREMENT_INDICATORS = listOf(
+            // Angular (2+)
+            "ng-app", "ng-version", "[_nghost", "[_ngcontent",
+            // Next.js / React
+            "__NEXT_DATA__", "/_next/static", "data-reactroot", "__react",
+            // Nuxt.js / Vue
+            "__NUXT__", "/_nuxt/", "data-v-", "__vue_",
+            // SvelteKit
+            "__sveltekit", "sveltekit", "svelte-",
+            // Astro
+            "astro-island", "astro:load", "/@astro/",
+            // Remix
+            "__remixContext", "/__remix-",
+            // SolidJS
+            "solid-js", "window._solid",
+            // Gatsby
+            "___gatsby", "gatsby-runtime",
+            // Qwik
+            "qwik-", "q:base",
+            // Generic SSR/SPA injection
+            "window.__INITIAL_STATE__", "window.__PRELOADED_STATE__",
+            "window.__APP_STATE__", "window.__SERVER_DATA__",
+            // JSON embedded state blobs
+            "application/json\">{",
+            // CloudFlare JS challenge
+            "cf-chl-bypass", "__cf_chl_"
+        )
+
+        private val LOGIN_INDICATOR_SELECTORS = listOf(
+            "form[action*='login']", "form#login", ".login-form",
+            "input[name='password']", "input[type='password']",
+            ".auth-required", "#login-required"
+        )
+
+        private val POPUP_SELECTORS = listOf(
+            ".popup, .modal, .overlay, .ad, .banner, .cookie, .notification, .interstitial",
+            "[class*='popup']", "[class*='modal']", "[class*='overlay']", "[class*='ad']",
+            "[id*='popup']", "[id*='modal']", "[id*='overlay']", "[id*='ad']"
+        )
+        private val CLOSE_BUTTON_SELECTORS = listOf(
+            ".close, .dismiss, .exit, .btn-close, .close-btn, .close-button, .modal-close, .popup-close",
+            "button[aria-label='Close']", "button[aria-label='Dismiss']", "[data-dismiss]", "[data-close]"
+        )
+
+        private val MEDIA_THUMBNAIL_SELECTORS = listOf(
+            ".thumbnail img", ".thumb img", "img.thumbnail",
+            ".poster", "img.poster", "[data-poster]"
+        )
+        private val MAIN_CONTENT_SELECTORS = listOf(
+            "main", "#main", ".main", "#content", ".content",
+            "article", ".articles", "#articles", ".container"
+        )
+        private val TITLE_SELECTOR_CANDIDATES = listOf(
+            "h1", "h2.title", ".title", "#title", "[class*='title']",
+            ".name", ".item-title", ".video-title", ".movie-title"
+        )
+        private val DESCRIPTION_SELECTOR_CANDIDATES = listOf(
+            ".description", "#description", ".desc", ".synopsis",
+            ".summary", "[class*='description']", "p.info"
+        )
+        private val DATE_SELECTOR_CANDIDATES = listOf(
+            ".date", ".time", ".timestamp", "[datetime]",
+            ".posted", ".published", "[class*='date']"
+        )
+        private val RATING_SELECTOR_CANDIDATES = listOf(
+            ".rating", ".stars", ".score", "[data-rating]",
+            ".imdb-rating", "[class*='rating']"
+        )
+        private val DRM_SIGNALS = listOf("widevine", "playready", "fairplay", "encrypted-media", "eme")
+        private val MEDIA_CONTENT_SIGNALS = listOf(".m3u8", ".mpd", ".mp4", ".webm", "videoplayback", "manifest")
+
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
+        private val BACKGROUND_IMAGE_URL_REGEX = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+        private val MEDIA_FILE_URL_REGEX = Regex("""['"`]([^'"`]+(?:\.m3u8|\.mpd|\.mp4|\.webm)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+        private val WEBPACK_SIGNALS_REGEX = Regex("""webpackJsonp|__webpack_require__|webpackChunk""")
+        private val SOURCE_MAP_REGEX = Regex("""sourceMappingURL=([^*\s]+)""")
+        private val ENDPOINT_SIGNAL_REGEX = Regex("""['"`]([^'"`]*(?:api|ajax|graphql|search|endpoint)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
     }
     
     /**
@@ -119,31 +246,53 @@ class SiteAnalyzerEngine @Inject constructor() {
         val startTime = System.currentTimeMillis()
 
         try {
-            // Normalize URL
-            val normalizedUrl = normalizeUrl(url)
-            val baseUrl = extractBaseUrl(normalizedUrl)
-            
-            // Fetch the page with modern browser headers
-            val connection = Jsoup.connect(normalizedUrl)
-                .userAgent(DEFAULT_USER_AGENT)
-                .timeout(DEFAULT_TIMEOUT)
-                .followRedirects(true)
-                .ignoreHttpErrors(true)
-                .ignoreContentType(false)
-                .headers(MODERN_REQUEST_HEADERS)
-            
-            val response = connection.execute()
-            val document = response.parse()
+            // Normalize URL (identical to the cache key computed above)
+            val normalizedUrl = normalizedKey
+
+            // Fetch the page with modern browser headers, then fall back to
+            // rendered content so JS-heavy sites can still be analyzed.
+            val fetchedPage = fetchAnalyzerPage(normalizedUrl)
+            val fetchedDocument = Jsoup.parse(fetchedPage.html, normalizedUrl)
+            val renderedHtml = if (detectJavaScriptRequirement(fetchedDocument)) {
+                try {
+                    withTimeoutOrNull(RENDER_TIMEOUT_MS) {
+                        HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                            url = normalizedUrl,
+                            waitSelector = "body",
+                            timeout = RENDER_TIMEOUT_MS.toInt()
+                        )
+                    }
+                } catch (_: Exception) {
+                    null
+                }
+            } else null
+            val activeHtml = renderedHtml ?: fetchedPage.html
+            // Without a rendered fallback, activeHtml is the exact string already
+            // parsed into fetchedDocument — reuse that Document instead of parsing
+            // the same HTML a second time.
+            val document = if (renderedHtml != null) Jsoup.parse(activeHtml, normalizedUrl) else fetchedDocument
             val loadTime = System.currentTimeMillis() - startTime
             
             // Perform all analyses
-            val securityAnalysis = analyzeSecurityHeaders(normalizedUrl, response.headers())
+            val securityAnalysis = analyzeSecurityHeaders(normalizedUrl, fetchedPage.headers)
             val domAnalysis = analyzeDOMStructure(document)
             val patterns = detectPatterns(document)
             val mediaAnalysis = analyzeMediaContent(document)
-            val apiAnalysis = detectAPIEndpoints(document, response.body())
+            val apiAnalysis = detectAPIEndpoints(document, activeHtml)
             val navigationStructure = analyzeNavigation(document)
             val scrapingStrategy = determineScrapingStrategy(document, patterns)
+            val capabilityReport = buildCapabilityReport(
+                url = normalizedUrl,
+                document = document,
+                html = activeHtml,
+                headers = fetchedPage.headers,
+                mediaAnalysis = mediaAnalysis,
+                apiAnalysis = apiAnalysis,
+                loadTime = loadTime
+            )
+            val enrichedHeaders = fetchedPage.headers.toMutableMap().apply {
+                put(CAPABILITY_REPORT_HEADER, json.encodeToString(capabilityReport))
+            }
             
             val result = SiteAnalysis(
                 providerId = providerId,
@@ -197,7 +346,7 @@ class SiteAnalyzerEngine @Inject constructor() {
                 // Performance
                 loadTime = loadTime,
                 resourceCount = document.select("script, link, img, video").size,
-                totalSize = response.body().length.toLong(),
+                totalSize = activeHtml.length.toLong(),
                 
                 // Scraping Config
                 scrapingStrategy = scrapingStrategy,
@@ -206,17 +355,52 @@ class SiteAnalyzerEngine @Inject constructor() {
                 
                 // Raw data
                 rawHtml = document.html().take(50000), // Limit storage
-                headers = json.encodeToString(response.headers()),
-                cookies = json.encodeToString(response.cookies())
+                headers = json.encodeToString(enrichedHeaders),
+                cookies = json.encodeToString(fetchedPage.cookies)
             )
             analysisCache[normalizedKey] = result to System.currentTimeMillis()
             result
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             // Return minimal analysis on failure
             SiteAnalysis(
                 providerId = providerId,
                 url = url,
                 securityScore = 0f
+            )
+        }
+    }
+
+    private suspend fun fetchAnalyzerPage(url: String): AnalyzerFetchedPage {
+        return try {
+            val response = Jsoup.connect(url)
+                .userAgent(DEFAULT_USER_AGENT)
+                .timeout(DEFAULT_TIMEOUT)
+                .followRedirects(true)
+                .ignoreHttpErrors(true)
+                .ignoreContentType(false)
+                .headers(MODERN_REQUEST_HEADERS)
+                .execute()
+            AnalyzerFetchedPage(
+                html = response.body(),
+                headers = response.headers(),
+                cookies = response.cookies()
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val renderedHtml = withTimeoutOrNull(RENDER_TIMEOUT_MS) {
+                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                    url = url,
+                    waitSelector = "body",
+                    timeout = DEFAULT_TIMEOUT
+                )
+            } ?: throw e
+            AnalyzerFetchedPage(
+                html = renderedHtml,
+                headers = emptyMap(),
+                cookies = emptyMap()
             )
         }
     }
@@ -270,6 +454,8 @@ class SiteAnalyzerEngine @Inject constructor() {
     private fun getSSLVersion(url: String): String? {
         return try {
             val connection = URL(url).openConnection() as? HttpsURLConnection
+            connection?.connectTimeout = 5_000
+            connection?.readTimeout = 5_000
             connection?.connect()
             // Get cipher suite which indicates TLS version
             val cipherSuite = connection?.cipherSuite
@@ -301,7 +487,7 @@ class SiteAnalyzerEngine @Inject constructor() {
      */
     private fun analyzeDOMStructure(document: Document): DOMAnalysisResult {
         val allElements = document.allElements
-        val uniqueTags = allElements.map { it.tagName() }.distinct().size
+        val uniqueTags = allElements.mapTo(mutableSetOf()) { it.tagName() }.size
         
         // Calculate max depth
         var maxDepth = 0
@@ -332,12 +518,7 @@ class SiteAnalyzerEngine @Inject constructor() {
         val areas = mutableListOf<ContentArea>()
         
         // Look for main content areas
-        val mainSelectors = listOf(
-            "main", "#main", ".main", "#content", ".content",
-            "article", ".articles", "#articles", ".container"
-        )
-        
-        mainSelectors.forEach { selector ->
+        MAIN_CONTENT_SELECTORS.forEach { selector ->
             document.select(selector).firstOrNull()?.let { element ->
                 areas.add(ContentArea(
                     selector = selector,
@@ -497,10 +678,12 @@ class SiteAnalyzerEngine @Inject constructor() {
     }
     
     private fun detectAdditionalPatterns(document: Document, patterns: MutableList<DetectedPattern>) {
-        // Infinite scroll detection
+        // Infinite scroll detection (serialize the document at most once for both
+        // checks; lazy keeps the short-circuited path serialization-free as before)
+        val html by lazy { document.html() }
         if (document.select("[data-infinite-scroll], .infinite-scroll, [class*='infinite']").isNotEmpty() ||
-            document.html().contains("IntersectionObserver") ||
-            document.html().contains("infinite")) {
+            html.contains("IntersectionObserver") ||
+            html.contains("infinite")) {
             patterns.add(DetectedPattern(
                 type = PatternType.INFINITE_SCROLL,
                 selector = "[data-infinite-scroll]",
@@ -610,10 +793,7 @@ class SiteAnalyzerEngine @Inject constructor() {
         }
 
         // Find thumbnail selectors
-        thumbnailSelector = listOf(
-            ".thumbnail img", ".thumb img", "img.thumbnail",
-            ".poster", "img.poster", "[data-poster]"
-        ).firstOrNull { cleanedDoc.select(it).isNotEmpty() }
+        thumbnailSelector = MEDIA_THUMBNAIL_SELECTORS.firstOrNull { cleanedDoc.select(it).isNotEmpty() }
 
         return MediaAnalysisResult(
             playerType = playerType,
@@ -626,23 +806,13 @@ class SiteAnalyzerEngine @Inject constructor() {
      * Remove overlays/popups/ads and auto-click close/dismiss buttons
      */
     private fun dismissOverlaysAndAds(document: Document): Document {
-        val popupSelectors = listOf(
-            ".popup, .modal, .overlay, .ad, .banner, .cookie, .notification, .interstitial",
-            "[class*='popup']", "[class*='modal']", "[class*='overlay']", "[class*='ad']",
-            "[id*='popup']", "[id*='modal']", "[id*='overlay']", "[id*='ad']"
-        )
-        val closeButtonSelectors = listOf(
-            ".close, .dismiss, .exit, .btn-close, .close-btn, .close-button, .modal-close, .popup-close",
-            "button[aria-label='Close']", "button[aria-label='Dismiss']", "[data-dismiss]", "[data-close]"
-        )
-
         // Remove overlays/popups/ads
-        popupSelectors.forEach { selector ->
+        POPUP_SELECTORS.forEach { selector ->
             document.select(selector).forEach { it.remove() }
         }
 
         // Simulate auto-clicking close/dismiss buttons
-        closeButtonSelectors.forEach { selector ->
+        CLOSE_BUTTON_SELECTORS.forEach { selector ->
             document.select(selector).forEach { it.remove() }
         }
 
@@ -662,19 +832,7 @@ class SiteAnalyzerEngine @Inject constructor() {
         val allText = html
 
         // --- REST API patterns (fetch, axios, jQuery ajax, XHR, Angular http) ---
-        val restPatterns = listOf(
-            Regex("""(?:fetch|axios\.get|axios\.post|http\.get|http\.post)\s*\(\s*['"`](\/api\/[^'"`\s\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""(?:\$\.ajax|XMLHttpRequest)[^'"]*url['":\s]+['"`](\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""url\s*:\s*['"`](\/api\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""['"`](\/api\/v\d+\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/rest\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/wp-json\/[^'"`\s]+)['"`]"""),  // WordPress REST
-            Regex("""['"`](\/ghost\/api\/[^'"`\s]+)['"`]"""),  // Ghost CMS
-            Regex("""['"`](\/admin\/api\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/content\/api\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/cms\/api\/[^'"`\s]+)['"`]""")
-        )
-        restPatterns.forEach { pattern ->
+        REST_API_PATTERNS.forEach { pattern ->
             pattern.findAll(scripts).forEach { match ->
                 val ep = match.groupValues[1]
                 if (ep.length > 3 && !ep.contains("//")) {
@@ -685,24 +843,19 @@ class SiteAnalyzerEngine @Inject constructor() {
         }
 
         // --- GraphQL detection ---
-        val graphqlIndicators = listOf("graphql", "gql`", " query {", " mutation {", " subscription {", "ApolloClient", "urql")
-        if (graphqlIndicators.any { scripts.contains(it, ignoreCase = true) }) {
+        if (GRAPHQL_INDICATORS.any { scripts.contains(it, ignoreCase = true) }) {
             detectedTypes.add("GraphQL")
-            listOf(
-                Regex("""['"`](\/graphql[^'"`\s]*)['"`]"""),
-                Regex("""['"](https?:\/\/[^'"`\s]+\/graphql[^'"`\s]*)['"]""")
-            ).forEach { p ->
+            GRAPHQL_ENDPOINT_PATTERNS.forEach { p ->
                 p.findAll(allText).forEach { m -> endpoints.add(m.groupValues[1]) }
             }
             // Look for Apollo/GraphQL endpoint config
-            Regex("""uri\s*:\s*['"`]([^'"`\s]+)['"`]""").findAll(scripts).forEach { m ->
+            GRAPHQL_URI_PATTERN.findAll(scripts).forEach { m ->
                 if (m.groupValues[1].length > 3) endpoints.add(m.groupValues[1])
             }
         }
 
         // --- WebSocket endpoint detection ---
-        val wsPattern = Regex("""new WebSocket\s*\(\s*['"`](wss?:\/\/[^'"`\s]+)['"`]""")
-        wsPattern.findAll(scripts).forEach { match ->
+        WEBSOCKET_PATTERN.findAll(scripts).forEach { match ->
             endpoints.add(match.groupValues[1])
             detectedTypes.add("WebSocket")
         }
@@ -710,23 +863,19 @@ class SiteAnalyzerEngine @Inject constructor() {
         // --- Strapi CMS ---
         if (allText.contains("strapi", ignoreCase = true)) {
             detectedTypes.add("Strapi")
-            Regex("""['"`](\/api\/[a-z-]+(?:\?[^'"`\s]*)?)['"`]""").findAll(scripts)
+            STRAPI_API_PATTERN.findAll(scripts)
                 .forEach { m -> endpoints.add(m.groupValues[1]) }
         }
 
         // --- Directus CMS ---
         if (allText.contains("directus", ignoreCase = true)) {
             detectedTypes.add("Directus")
-            Regex("""['"`](\/items\/[^'"`\s]+)['"`]""").findAll(scripts)
+            DIRECTUS_API_PATTERN.findAll(scripts)
                 .forEach { m -> endpoints.add(m.groupValues[1]) }
         }
 
         // --- JSON data endpoints embedded in HTML ---
-        listOf(
-            Regex("""['"`](https?:\/\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
-            Regex("""['"`](\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
-            Regex("""data-src=['"`](https?:\/\/[^'"`\s]+)['"`]""")
-        ).forEach { p ->
+        JSON_ENDPOINT_PATTERNS.forEach { p ->
             p.findAll(allText).forEach { m ->
                 val ep = m.groupValues[1]
                 if (ep.contains("json") || ep.contains("api")) {
@@ -738,7 +887,7 @@ class SiteAnalyzerEngine @Inject constructor() {
 
         // --- Data attributes ---
         document.select("[data-api], [data-url], [data-endpoint], [data-src-url], [data-ajax-url]").forEach { el ->
-            listOf("data-api", "data-url", "data-endpoint", "data-src-url", "data-ajax-url").forEach { attr ->
+            DATA_ENDPOINT_ATTRIBUTES.forEach { attr ->
                 el.attr(attr).takeIf { it.isNotEmpty() && it.startsWith("/") }?.let {
                     endpoints.add(it)
                     detectedTypes.add("REST")
@@ -844,35 +993,7 @@ class SiteAnalyzerEngine @Inject constructor() {
     private fun detectJavaScriptRequirement(document: Document): Boolean {
         val html = document.html()
         // 2026-era SPA and SSR framework indicators
-        val indicators = listOf(
-            // Angular (2+)
-            "ng-app", "ng-version", "[_nghost", "[_ngcontent",
-            // Next.js / React
-            "__NEXT_DATA__", "/_next/static", "data-reactroot", "__react",
-            // Nuxt.js / Vue
-            "__NUXT__", "/_nuxt/", "data-v-", "__vue_",
-            // SvelteKit
-            "__sveltekit", "sveltekit", "svelte-",
-            // Astro
-            "astro-island", "astro:load", "/@astro/",
-            // Remix
-            "__remixContext", "/__remix-",
-            // SolidJS
-            "solid-js", "window._solid",
-            // Gatsby
-            "___gatsby", "gatsby-runtime",
-            // Qwik
-            "qwik-", "q:base",
-            // Generic SSR/SPA injection
-            "window.__INITIAL_STATE__", "window.__PRELOADED_STATE__",
-            "window.__APP_STATE__", "window.__SERVER_DATA__",
-            // JSON embedded state blobs
-            "application/json\">{",
-            // CloudFlare JS challenge
-            "cf-chl-bypass", "__cf_chl_"
-        )
-
-        if (indicators.any { html.contains(it) }) return true
+        if (JS_REQUIREMENT_INDICATORS.any { html.contains(it) }) return true
 
         // If body text is sparse but scripts are heavy → JS-rendered
         val bodyText = document.body()?.text() ?: ""
@@ -887,13 +1008,7 @@ class SiteAnalyzerEngine @Inject constructor() {
     }
     
     private fun detectAuthRequirement(document: Document): Boolean {
-        val loginIndicators = listOf(
-            "form[action*='login']", "form#login", ".login-form",
-            "input[name='password']", "input[type='password']",
-            ".auth-required", "#login-required"
-        )
-        
-        return loginIndicators.any { document.select(it).isNotEmpty() }
+        return LOGIN_INDICATOR_SELECTORS.any { document.select(it).isNotEmpty() }
     }
     
     // Helper functions
@@ -931,6 +1046,317 @@ class SiteAnalyzerEngine @Inject constructor() {
         
         return confidence.coerceIn(0f, 1f)
     }
+
+    private suspend fun buildCapabilityReport(
+        url: String,
+        document: Document,
+        html: String,
+        headers: Map<String, String>,
+        mediaAnalysis: MediaAnalysisResult,
+        apiAnalysis: APIAnalysisResult,
+        loadTime: Long
+    ): AnalyzerCapabilityReport {
+        val baseUrl = extractBaseUrl(url)
+        val thumbnails = collectThumbnailUrls(document, baseUrl)
+        val probes = coroutineScope {
+            val tokenProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { tokenManager.harvestTokens(url) } }
+                catch (_: Exception) { null }
+            }
+            val endpointProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } }
+                catch (_: Exception) { null }
+            }
+            val ocrProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { visionEngine.batchExtract(thumbnails.take(8)) } }
+                catch (_: Exception) { null }
+            }
+            val networkProbe = async {
+                withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { analyzeNetworkTopology(url, headers) }
+            }
+            CapabilityProbeResults(
+                tokenBundle = tokenProbe.await(),
+                deepEndpoints = endpointProbe.await(),
+                ocrKeywords = ocrProbe.await().orEmpty(),
+                network = networkProbe.await() ?: NetworkTopologyResult(emptyList(), "Unknown", emptyList())
+            )
+        }
+        val tokenBundle = probes.tokenBundle
+        val deepEndpoints = probes.deepEndpoints
+        val ocrKeywords = probes.ocrKeywords
+        val network = probes.network
+        val tlsProfile = tlsFingerprintEngine.defaultProfileInfo()
+        val nativeTls = tlsFingerprintEngine.nativeImpersonationInfo()
+        val waf = analyzeWafFingerprint(headers, html)
+        val jsBundle = analyzeJsBundles(document, html, baseUrl)
+        val hiddenInputs = document.select("input[type=hidden]").size
+        val formFields = document.select("input, textarea, select").size
+        val lazyLoadCount = document.select("[loading=lazy], [data-src], [data-lazy-src], [data-original], [data-srcset]").size
+        val hasInfiniteScroll = html.contains("IntersectionObserver", ignoreCase = true) ||
+            html.contains("infinite", ignoreCase = true) ||
+            document.select("[class*=infinite], [data-infinite], [data-load-more], .load-more").isNotEmpty()
+        val shadowDomSignals = html.contains("attachShadow", ignoreCase = true) ||
+            html.contains("shadowRoot", ignoreCase = true) ||
+            document.select("template[shadowroot], template[shadowrootmode]").isNotEmpty()
+        val iframeDepth = calculateIframeDepth(document)
+        val mediaUrls = extractMediaUrls(document, html, baseUrl)
+        val drmSignals = DRM_SIGNALS
+            .filter { html.contains(it, ignoreCase = true) }
+
+        // Computed once and reused by the checks below. The document is not
+        // mutated anywhere in this function, so each of these pure scans would
+        // otherwise be repeated with identical results.
+        val searchInputSelector = findSearchInput(document)
+        val capabilityPatterns = detectPatterns(document)
+        val hasResultPattern = capabilityPatterns.any { it.type == PatternType.RESULT_ITEM || it.type == PatternType.RESULT_LIST }
+        val hasPaginationPattern = capabilityPatterns.any { it.type == PatternType.PAGINATION }
+        val externalScripts = document.select("script[src]")
+        val renderBlockingCandidates = document.select("script:not([async]):not([defer]), link[rel=stylesheet]")
+
+        return AnalyzerCapabilityReport(
+            generatedAt = System.currentTimeMillis(),
+            sections = listOf(
+                AnalyzerCapabilitySection(
+                    title = "Security Analysis",
+                    checks = listOf(
+                        capability("SSL/TLS", if (url.startsWith("https")) "active" else "missing", if (url.startsWith("https")) "HTTPS transport enabled" else "HTTP transport only"),
+                        capability("CSP", if (headers.keys.any { it.equals("Content-Security-Policy", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("Content-Security-Policy", true) }?.value?.take(120) ?: "No CSP header"),
+                        capability("HSTS", if (headers.keys.any { it.equals("Strict-Transport-Security", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("Strict-Transport-Security", true) }?.value ?: "No HSTS header"),
+                        capability("X-Frame-Options", if (headers.keys.any { it.equals("X-Frame-Options", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("X-Frame-Options", true) }?.value ?: "No frame protection header"),
+                        capability("CORS", if (headers.keys.any { it.equals("Access-Control-Allow-Origin", true) }) "detected" else "not_detected", headers.entries.firstOrNull { it.key.equals("Access-Control-Allow-Origin", true) }?.value ?: "No public CORS header")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "DOM Structure",
+                    checks = listOf(
+                        capability("Shadow DOM", if (shadowDomSignals) "detected" else "not_detected", "Static signals: attachShadow/shadowRoot/template shadowroot"),
+                        capability("iFrame Depth", if (iframeDepth > 0) "detected" else "not_detected", iframeDepth.toString()),
+                        capability("Form Fields", if (formFields > 0) "detected" else "not_detected", "$formFields fields, $hiddenInputs hidden"),
+                        capability("Script Sources", if (externalScripts.isNotEmpty()) "detected" else "not_detected", "${externalScripts.size} external scripts")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Pattern Detection",
+                    checks = listOf(
+                        capability("Search Forms", if (searchInputSelector != null) "detected" else "not_detected", searchInputSelector ?: "No search input selector"),
+                        capability("Result Lists", if (hasResultPattern) "detected" else "not_detected", "Selector pattern analysis"),
+                        capability("Pagination", if (hasPaginationPattern) "detected" else "not_detected", "Pagination selectors"),
+                        capability("Lazy Load", if (lazyLoadCount > 0) "detected" else "not_detected", "$lazyLoadCount lazy-load elements"),
+                        capability("Infinite Scroll", if (hasInfiniteScroll) "detected" else "not_detected", "IntersectionObserver/load-more/static infinite-scroll signals")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Media Detection",
+                    checks = listOf(
+                        capability("Streams", if (mediaUrls.isNotEmpty()) "detected" else "not_detected", mediaUrls.take(5).joinToString(", ").ifBlank { "No direct media URLs" }),
+                        capability("Embedded Players", if (!mediaAnalysis.playerType.isNullOrBlank()) "detected" else "not_detected", mediaAnalysis.playerType ?: "No known player"),
+                        capability("CDN Origins", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider),
+                        capability("DRM Type", if (drmSignals.isNotEmpty()) "detected" else "not_detected", drmSignals.joinToString(", ").ifBlank { "No static DRM/EME signal" }),
+                        capability("Thumbnail URLs", if (thumbnails.isNotEmpty()) "detected" else "not_detected", "${thumbnails.size} thumbnail candidates")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "API & Endpoint Discovery",
+                    checks = listOf(
+                        capability("Static API Detection", if (apiAnalysis.hasAPI) "detected" else "not_detected", "${apiAnalysis.endpoints.size} endpoints, type=${apiAnalysis.type ?: "unknown"}"),
+                        capability("Deep Endpoint Discovery", if ((deepEndpoints?.searchEndpoints.orEmpty() + deepEndpoints?.apiEndpoints.orEmpty()).isNotEmpty()) "detected" else "not_detected", "${deepEndpoints?.searchEndpoints?.size ?: 0} search, ${deepEndpoints?.apiEndpoints?.size ?: 0} API"),
+                        capability("GraphQL", if ((apiAnalysis.type == "GraphQL") || deepEndpoints?.hasGraphQL == true) "detected" else "not_detected", "GraphQL endpoint/signature scan"),
+                        capability("WebSocket", if (apiAnalysis.endpoints.any { it.startsWith("ws") }) "detected" else "not_detected", "Static WebSocket constructor scan")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Performance Metrics",
+                    checks = listOf(
+                        capability("TTFB/Load Time", "active", "${loadTime}ms"),
+                        capability("Resource Count", "active", document.select("script, link, img, video, iframe").size.toString()),
+                        capability("Page Weight", "active", "${html.length} bytes"),
+                        capability("Render Blocking", if (renderBlockingCandidates.isNotEmpty()) "detected" else "not_detected", "${renderBlockingCandidates.size} candidates"),
+                        capability("CDN Detection", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider)
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Token & Auth Harvesting",
+                    checks = listOf(
+                        capability("Bearer Tokens", if (!tokenBundle?.bearerTokens.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.bearerTokens?.size ?: 0} found"),
+                        capability("API Keys", if (!tokenBundle?.apiKeys.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.apiKeys?.size ?: 0} found"),
+                        capability("CSRF Tokens", if (!tokenBundle?.csrfTokens.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.csrfTokens?.size ?: 0} found"),
+                        capability("Session IDs", if (!tokenBundle?.sessionIds.isNullOrEmpty() || !tokenBundle?.cookies.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.sessionIds?.size ?: 0} IDs, ${tokenBundle?.cookies?.size ?: 0} cookies"),
+                        capability("Base64/Base44 Blobs", if (!tokenBundle?.base64Blobs.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.base64Blobs?.size ?: 0} candidates")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "WAF Fingerprinting",
+                    checks = listOf(
+                        capability("Detected WAF/CDN", if (waf.detected) "detected" else "not_detected", waf.provider),
+                        capability("Bypass Strategy", "active", waf.strategy)
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "JS Bundle Analysis",
+                    checks = listOf(
+                        capability("Webpack Chunks", if (jsBundle.webpackChunks > 0) "detected" else "not_detected", "${jsBundle.webpackChunks} chunk signals"),
+                        capability("Obfuscated Endpoints", if (jsBundle.obfuscatedEndpointSignals > 0) "detected" else "not_detected", "${jsBundle.obfuscatedEndpointSignals} endpoint-like strings"),
+                        capability("Source Maps", if (jsBundle.sourceMaps > 0) "detected" else "not_detected", "${jsBundle.sourceMaps} source-map refs")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Network Topology",
+                    checks = listOf(
+                        capability("Resolved IPs", if (network.ips.isNotEmpty()) "detected" else "error", network.ips.joinToString(", ").ifBlank { "No DNS resolution" }),
+                        capability("CDN Provider", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider),
+                        capability("Reverse Proxy", if (network.reverseProxySignals.isNotEmpty()) "detected" else "not_detected", network.reverseProxySignals.joinToString(", ").ifBlank { "No static proxy headers" }),
+                        capability("ASN/GeoIP", "native_limited", "Requires external IP intelligence service; DNS resolution is active")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Browser Fingerprint Evasion",
+                    checks = listOf(
+                        capability("Header Rotation", "active", "Browser-like User-Agent and request headers applied"),
+                        capability("Cookie Persistence", "active", "Native helper keeps an in-memory cookie jar; WebView cookies enabled"),
+                        capability("Navigator Spoof", "active", "WebView JS override for webdriver/platform/hardware/device memory"),
+                        capability("Canvas/WebGL Spoof", "active", "WebView JS overrides for canvas noise and WebGL vendor/renderer"),
+                        capability("TLS Fingerprint", "active", "Chromium WebView and OkHttp TLS profile used for rendered fallback fetches"),
+                        capability("OkHttp TLS Profile Rotation", "active", "${tlsProfile.profile}: ${tlsProfile.description}"),
+                        capability(
+                            "Native TLS Impersonation",
+                            if (nativeTls.available) "active" else "packaged_fallback",
+                            if (nativeTls.available) {
+                                "Go tls-client JNI bridge available; default=${nativeTls.defaultProfile}; profiles=${nativeTls.supportedProfiles.joinToString(", ")}"
+                            } else {
+                                "Go tls-client bridge packaged for arm64-v8a; runtime load pending/unavailable: ${nativeTls.unavailableReason ?: "unknown"}"
+                            }
+                        ),
+                        capability("Custom JA3 Extension Order", if (nativeTls.available) "active" else "packaged_fallback", "Native Go tls-client supports browser ClientHello/profile impersonation; Android API fallback cannot override every ClientHello field")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "OCR Vision Scan",
+                    checks = listOf(
+                        capability("Thumbnail OCR", if (ocrKeywords.values.any { it.isNotEmpty() }) "detected" else if (thumbnails.isNotEmpty()) "active" else "not_detected", "${ocrKeywords.values.sumOf { it.size }} keywords from ${ocrKeywords.size} thumbnails"),
+                        capability("Quality Labels", if (ocrKeywords.values.flatten().any { it.contains("720") || it.contains("1080") || it.contains("hd") }) "detected" else "not_detected", "ML Kit OCR keyword scan")
+                    )
+                )
+            )
+        )
+    }
+
+    private fun capability(name: String, status: String, detail: String): AnalyzerCapabilityCheck =
+        AnalyzerCapabilityCheck(name = name, status = status, detail = detail)
+
+    private fun collectThumbnailUrls(document: Document, baseUrl: String): List<String> {
+        return document.select("img, source, video, [data-thumb], [data-thumbnail], [data-poster], [data-image], [style*='background-image']")
+            .mapNotNull { element -> extractImageCandidate(element, baseUrl) }
+            .distinct()
+            .take(30)
+    }
+
+    private fun extractImageCandidate(element: Element, baseUrl: String): String? {
+        val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
+            ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
+        val fromSrcset = srcset?.split(",")
+            ?.map { it.trim().split(WHITESPACE_SPLIT_REGEX).firstOrNull().orEmpty() }
+            ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", true) }
+        val raw = listOf(
+            element.attr("src"),
+            element.attr("data-src"),
+            element.attr("data-lazy-src"),
+            element.attr("data-original"),
+            element.attr("data-thumb"),
+            element.attr("data-thumbnail"),
+            element.attr("data-poster"),
+            element.attr("data-image"),
+            element.attr("poster"),
+            fromSrcset,
+            BACKGROUND_IMAGE_URL_REGEX
+                .find(element.attr("style"))?.groupValues?.getOrNull(1)
+        ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", true) } ?: return null
+        return normalizeAssetUrl(raw, baseUrl)
+    }
+
+    private fun extractMediaUrls(document: Document, html: String, baseUrl: String): List<String> {
+        val urls = linkedSetOf<String>()
+        document.select("video[src], source[src], a[href], iframe[src]").forEach { element ->
+            val raw = element.attr("src").ifBlank { element.attr("href") }
+            if (raw.containsMediaSignal()) urls.add(normalizeAssetUrl(raw, baseUrl))
+        }
+        MEDIA_FILE_URL_REGEX
+            .findAll(html)
+            .forEach { match -> urls.add(normalizeAssetUrl(match.groupValues[1].replace("\\/", "/"), baseUrl)) }
+        return urls.take(20)
+    }
+
+    private fun String.containsMediaSignal(): Boolean {
+        val lower = lowercase()
+        return MEDIA_CONTENT_SIGNALS.any { lower.contains(it) }
+    }
+
+    private fun calculateIframeDepth(document: Document): Int {
+        val iframeCount = document.select("iframe").size
+        return when {
+            iframeCount == 0 -> 0
+            iframeCount < 3 -> 1
+            iframeCount < 8 -> 2
+            else -> 3
+        }
+    }
+
+    private fun analyzeNetworkTopology(url: String, headers: Map<String, String>): NetworkTopologyResult {
+        val host = try { URL(url).host } catch (_: Exception) { "" }
+        val ips = try { InetAddress.getAllByName(host).mapNotNull { it.hostAddress }.distinct() } catch (_: Exception) { emptyList() }
+        val headerText = headers.entries.joinToString(" ") { "${it.key}:${it.value}" }.lowercase()
+        val cdn = when {
+            "cloudflare" in headerText || headers.keys.any { it.equals("CF-RAY", true) } -> "Cloudflare"
+            "akamai" in headerText -> "Akamai"
+            "fastly" in headerText -> "Fastly"
+            "cloudfront" in headerText || "x-amz-cf" in headerText -> "Amazon CloudFront"
+            "bunny" in headerText -> "BunnyCDN"
+            "cdn" in headerText -> "Generic CDN"
+            else -> "Unknown"
+        }
+        val proxySignals = headers.keys.filter { key ->
+            key.equals("Via", true) || key.equals("X-Forwarded-For", true) ||
+                key.equals("X-Real-IP", true) || key.equals("X-Cache", true)
+        }
+        return NetworkTopologyResult(ips = ips, cdnProvider = cdn, reverseProxySignals = proxySignals)
+    }
+
+    private fun analyzeWafFingerprint(headers: Map<String, String>, html: String): WafFingerprintResult {
+        val combined = (headers.entries.joinToString(" ") { "${it.key}:${it.value}" } + " " + html.take(5000)).lowercase()
+        val provider = when {
+            "cf-ray" in combined || "cloudflare" in combined -> "Cloudflare"
+            "akamai" in combined || "_abck" in combined -> "Akamai"
+            "imperva" in combined || "incapsula" in combined -> "Imperva/Incapsula"
+            "sucuri" in combined -> "Sucuri"
+            "datadome" in combined -> "DataDome"
+            "perimeterx" in combined || "_px" in combined -> "PerimeterX"
+            else -> "None detected"
+        }
+        val strategy = if (provider == "None detected") {
+            "Standard browser-like headers + retries"
+        } else {
+            "CloudflareBypassEngine/native cookie replay/headless-helper fallback"
+        }
+        return WafFingerprintResult(detected = provider != "None detected", provider = provider, strategy = strategy)
+    }
+
+    private fun analyzeJsBundles(document: Document, html: String, baseUrl: String): JsBundleResult {
+        val scripts = document.select("script[src]").map { normalizeAssetUrl(it.attr("src"), baseUrl) }
+        val webpackSignals = scripts.count { it.contains("chunk", true) || it.contains("webpack", true) || it.contains("_next/", true) } +
+            WEBPACK_SIGNALS_REGEX.findAll(html).count()
+        val sourceMaps = SOURCE_MAP_REGEX.findAll(html).count() +
+            scripts.count { it.endsWith(".map", true) }
+        val endpointSignals = ENDPOINT_SIGNAL_REGEX
+            .findAll(html)
+            .count()
+        return JsBundleResult(webpackChunks = webpackSignals, sourceMaps = sourceMaps, obfuscatedEndpointSignals = endpointSignals)
+    }
+
+    private fun normalizeAssetUrl(url: String, baseUrl: String): String = when {
+        url.startsWith("http") -> url
+        url.startsWith("//") -> "https:$url"
+        url.startsWith("/") -> "${extractBaseUrl(baseUrl).trimEnd('/')}$url"
+        else -> "${baseUrl.trimEnd('/')}/$url"
+    }
     
     private fun findSearchInput(document: Document): String? {
         SEARCH_INPUT_SELECTORS.forEach { selector ->
@@ -942,35 +1368,19 @@ class SiteAnalyzerEngine @Inject constructor() {
     }
     
     private fun findTitleSelector(document: Document, patterns: List<DetectedPattern>): String? {
-        val candidates = listOf(
-            "h1", "h2.title", ".title", "#title", "[class*='title']",
-            ".name", ".item-title", ".video-title", ".movie-title"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return TITLE_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findDescriptionSelector(document: Document): String? {
-        val candidates = listOf(
-            ".description", "#description", ".desc", ".synopsis",
-            ".summary", "[class*='description']", "p.info"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return DESCRIPTION_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findDateSelector(document: Document): String? {
-        val candidates = listOf(
-            ".date", ".time", ".timestamp", "[datetime]",
-            ".posted", ".published", "[class*='date']"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return DATE_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findRatingSelector(document: Document): String? {
-        val candidates = listOf(
-            ".rating", ".stars", ".score", "[data-rating]",
-            ".imdb-rating", "[class*='rating']"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return RATING_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
     
     private fun extractUrlPattern(url: String): String {
@@ -984,6 +1394,12 @@ class SiteAnalyzerEngine @Inject constructor() {
     }
     
     // Data classes for internal use
+    data class AnalyzerFetchedPage(
+        val html: String,
+        val headers: Map<String, String>,
+        val cookies: Map<String, String>
+    )
+
     data class SecurityAnalysisResult(
         val score: Float,
         val sslVersion: String?,
@@ -1017,6 +1433,31 @@ class SiteAnalyzerEngine @Inject constructor() {
         val endpoints: List<String>,
         val type: String?
     )
+
+    data class NetworkTopologyResult(
+        val ips: List<String>,
+        val cdnProvider: String,
+        val reverseProxySignals: List<String>
+    )
+
+    private data class CapabilityProbeResults(
+        val tokenBundle: TokenManager.TokenBundle?,
+        val deepEndpoints: DiscoveredEndpoints?,
+        val ocrKeywords: Map<String, List<String>>,
+        val network: NetworkTopologyResult
+    )
+
+    data class WafFingerprintResult(
+        val detected: Boolean,
+        val provider: String,
+        val strategy: String
+    )
+
+    data class JsBundleResult(
+        val webpackChunks: Int,
+        val sourceMaps: Int,
+        val obfuscatedEndpointSignals: Int
+    )
 }
 
 @kotlinx.serialization.Serializable
@@ -1039,4 +1480,23 @@ data class NavigationItem(
     val text: String,
     val url: String,
     val hasSubmenu: Boolean
+)
+
+@Serializable
+data class AnalyzerCapabilityReport(
+    val generatedAt: Long,
+    val sections: List<AnalyzerCapabilitySection>
+)
+
+@Serializable
+data class AnalyzerCapabilitySection(
+    val title: String,
+    val checks: List<AnalyzerCapabilityCheck>
+)
+
+@Serializable
+data class AnalyzerCapabilityCheck(
+    val name: String,
+    val status: String,
+    val detail: String
 )
